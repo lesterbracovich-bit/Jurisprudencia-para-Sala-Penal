@@ -123,6 +123,14 @@ def load_data():
         return pd.DataFrame()
 
     conn = sqlite3.connect(DB_PATH)
+    # Asegurar que la columna ratificaciones existe
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA table_info(sentencias)")
+    cols = [c[1] for c in cursor.fetchall()]
+    if "ratificaciones" not in cols:
+        cursor.execute("ALTER TABLE sentencias ADD COLUMN ratificaciones TEXT")
+        conn.commit()
+
     query = """
         SELECT 
             id,
@@ -131,6 +139,7 @@ def load_data():
             COALESCE(fecha, 'Sin fecha') AS fecha,
             COALESCE(extracto, '') AS extracto,
             COALESCE(contenido_citado, '') AS contenido_citado,
+            COALESCE(ratificaciones, '') AS ratificaciones,
             COALESCE(archivo_origen, '') AS archivo_origen
         FROM sentencias
         ORDER BY id DESC
@@ -157,6 +166,7 @@ def main():
     # Encabezado formal
     st.markdown('<div class="main-title">⚖️ Sistema de Jurisprudencia del Tribunal Supremo de Justicia</div>', unsafe_allow_html=True)
     st.markdown('<div class="sub-title">Consulta, búsqueda temática y lectura especializada de sentencias y criterios vinculantes</div>', unsafe_allow_html=True)
+    st.markdown('<div style="color: #94a3b8; font-size: 0.95rem; margin-top: -1.1rem; margin-bottom: 1.4rem;">📖 <em>Compilado por Lester Bracovich</em></div>', unsafe_allow_html=True)
 
     df = load_data()
 
@@ -198,6 +208,15 @@ def main():
             st.cache_data.clear()
             st.rerun()
 
+        st.markdown(
+            """
+            <div style="text-align: center; color: #64748b; font-size: 0.85rem; margin-top: 1.5rem; border-top: 1px solid #334155; padding-top: 12px;">
+                📚 Compilado por <strong>Lester Bracovich</strong>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
     # ─── Aplicación de Filtros ────────────────────────────────────────────────
     df_filtrado = df.copy()
 
@@ -211,6 +230,7 @@ def main():
         condicion = (
             df_filtrado["extracto"].str.lower().str.contains(termino, na=False)
             | df_filtrado["contenido_citado"].str.lower().str.contains(termino, na=False)
+            | df_filtrado["ratificaciones"].str.lower().str.contains(termino, na=False)
             | df_filtrado["numero"].astype(str).str.lower().str.contains(termino, na=False)
         )
         df_filtrado = df_filtrado[condicion]
@@ -241,6 +261,7 @@ def main():
         fecha = row["fecha"]
         extracto = row["extracto"]
         contenido_citado = row["contenido_citado"]
+        ratificaciones = row.get("ratificaciones", "") or ""
         archivo = row["archivo_origen"]
 
         # Tarjeta limpia con borde
@@ -274,6 +295,17 @@ def main():
 
             st.markdown("<hr style='margin: 8px 0 14px 0; border: none; border-top: 1px solid #334155;'/>", unsafe_allow_html=True)
 
+            # Línea de Precedente / Ratificación (si existe)
+            if ratificaciones.strip():
+                st.markdown(
+                    f"""
+                    <div style="background-color: rgba(59, 130, 246, 0.12); border-left: 3px solid #60a5fa; border-radius: 4px; padding: 6px 12px; margin-bottom: 12px; color: #93c5fd; font-size: 0.95rem;">
+                        🔁 <strong>Línea de Precedente / Ratificación:</strong> {ratificaciones}
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
             # Ratio Decidendi / Extracto Jurídico
             if extracto.strip():
                 st.markdown("**📌 Criterio Jurídico / Ratio Decidendi:**")
@@ -283,10 +315,6 @@ def main():
             if contenido_citado.strip() and contenido_citado.strip() != "Sin cita textual expresa":
                 st.markdown("**📜 Texto Literal Citado en el Documento:**")
                 st.markdown(f'<div class="cita-box">"{contenido_citado}"</div>', unsafe_allow_html=True)
-
-            # Pie de tarjeta con archivo de origen
-            if archivo:
-                st.caption(f"📁 Documento de origen: `{archivo}`")
 
 
 if __name__ == "__main__":
