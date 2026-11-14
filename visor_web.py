@@ -24,90 +24,126 @@ st.set_page_config(
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "jurisprudencia_ia.db")
 
-# ─── Estilos CSS Personalizados ───────────────────────────────────────────────
+# ─── Estilos CSS Personalizados (Bimodal: Modo Claro y Modo Oscuro) ────────────
 st.markdown(
     """
     <style>
-    /* Estilos generales adaptados para fondo oscuro y lectura clara */
+    /* Tipografía y colores adaptativos usando variables nativas de Streamlit */
     .main-title {
         font-family: 'Georgia', serif;
         font-size: 2.3rem;
-        color: #ffffff !important;
+        color: var(--text-color) !important;
         font-weight: 700;
         margin-bottom: 0.2rem;
     }
     .sub-title {
-        color: #cbd5e1 !important;
-        font-size: 1.1rem;
-        margin-bottom: 1.5rem;
+        color: var(--text-color) !important;
+        opacity: 0.82;
+        font-size: 1.08rem;
+        margin-bottom: 0.4rem;
+    }
+    .credit-line {
+        color: var(--text-color) !important;
+        opacity: 0.65;
+        font-size: 0.95rem;
+        margin-top: -0.2rem;
+        margin-bottom: 1.4rem;
     }
     .sentencia-header {
         font-size: 1.35rem;
         font-weight: 800;
-        color: #ffffff !important;
+        color: var(--text-color) !important;
         letter-spacing: 0.5px;
     }
     .fecha-label {
         text-align: right;
-        color: #e2e8f0 !important;
-        font-size: 1.05rem;
+        color: var(--text-color) !important;
+        opacity: 0.85;
+        font-size: 1.02rem;
         font-weight: 600;
     }
     .badge-sala {
         padding: 4px 12px;
         border-radius: 12px;
-        font-size: 0.9rem;
+        font-size: 0.88rem;
         font-weight: 700;
         display: inline-block;
+        color: #ffffff !important;
+        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
     }
     .badge-penal {
-        background-color: #7f1d1d !important;
-        color: #fee2e2 !important;
-        border: 1px solid #b91c1c;
+        background-color: #991b1b !important;
+        border: 1px solid #7f1d1d;
     }
     .badge-const {
-        background-color: #1e3a8a !important;
-        color: #dbeafe !important;
-        border: 1px solid #2563eb;
+        background-color: #1d4ed8 !important;
+        border: 1px solid #1e40af;
+    }
+    .badge-civil {
+        background-color: #047857 !important;
+        border: 1px solid #065f46;
     }
     .badge-plena {
-        background-color: #78350f !important;
-        color: #fef3c7 !important;
-        border: 1px solid #d97706;
+        background-color: #b45309 !important;
+        border: 1px solid #92400e;
     }
     .badge-sala-default {
-        background-color: #334155 !important;
-        color: #f8fafc !important;
-        border: 1px solid #475569;
+        background-color: #475569 !important;
+        border: 1px solid #334155;
+    }
+    .badge-tema {
+        background-color: rgba(14, 165, 233, 0.13) !important;
+        border: 1px solid #0284c7 !important;
+        color: var(--text-color) !important;
+        font-size: 0.92rem;
+        font-weight: 700;
+        padding: 3px 10px;
+        border-radius: 6px;
+        display: inline-block;
+    }
+    .ratif-box {
+        background-color: rgba(59, 130, 246, 0.10) !important;
+        border-left: 3px solid #2563eb !important;
+        border-radius: 4px;
+        padding: 8px 12px;
+        margin-bottom: 12px;
+        color: var(--text-color) !important;
+        font-size: 0.95rem;
     }
     .extracto-text {
-        font-size: 1.08rem;
+        font-size: 1.06rem;
         line-height: 1.7;
-        color: #f8fafc !important;
+        color: var(--text-color) !important;
         text-align: justify;
         margin-top: 0.5rem;
         margin-bottom: 0.7rem;
     }
     .cita-box {
-        background-color: rgba(30, 41, 59, 0.7) !important;
-        border-left: 4px solid #60a5fa !important;
+        background-color: var(--secondary-background-color) !important;
+        border-left: 4px solid #2563eb !important;
         padding: 14px 18px;
         margin-top: 10px;
         border-radius: 0 8px 8px 0;
         font-style: italic;
-        color: #f1f5f9 !important;
+        color: var(--text-color) !important;
         line-height: 1.65;
         font-size: 1.02rem;
         text-align: justify;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
     }
     .metadata-row {
         font-size: 1.05rem;
-        color: #ffffff !important;
+        color: var(--text-color) !important;
         margin-bottom: 0.4rem;
         display: flex;
         align-items: center;
         flex-wrap: wrap;
         gap: 8px;
+    }
+    .tarjeta-divider {
+        margin: 8px 0 14px 0;
+        border: none;
+        border-top: 1px solid rgba(148, 163, 184, 0.28);
     }
     </style>
     """,
@@ -153,12 +189,14 @@ def load_data():
 
 
 def get_sala_badge_class(sala: str) -> str:
-    """Devuelve clase CSS acorde a la sala para destacar visualmente."""
+    """Devuelve clase CSS acorde a la sala para destacar visualmente con alto contraste."""
     sala_lower = sala.lower()
     if "penal" in sala_lower:
         return "badge-penal"
     elif "constitucional" in sala_lower:
         return "badge-const"
+    elif "civil" in sala_lower:
+        return "badge-civil"
     elif "plena" in sala_lower:
         return "badge-plena"
     return "badge-sala-default"
@@ -166,10 +204,10 @@ def get_sala_badge_class(sala: str) -> str:
 
 # ─── Aplicación Principal ─────────────────────────────────────────────────────
 def main():
-    # Encabezado formal
+    # Encabezado formal adaptable a modo claro y oscuro
     st.markdown('<div class="main-title">⚖️ Sistema de Jurisprudencia del Tribunal Supremo de Justicia</div>', unsafe_allow_html=True)
     st.markdown('<div class="sub-title">Consulta, búsqueda temática y lectura especializada de sentencias y criterios vinculantes</div>', unsafe_allow_html=True)
-    st.markdown('<div style="color: #94a3b8; font-size: 0.95rem; margin-top: -1.1rem; margin-bottom: 1.4rem;">📖 <em>Compilado por Lester Bracovich</em></div>', unsafe_allow_html=True)
+    st.markdown('<div class="credit-line">📖 <em>Compilado por Lester Bracovich</em></div>', unsafe_allow_html=True)
 
     df = load_data()
 
@@ -325,8 +363,8 @@ def main():
             if tema.strip():
                 st.markdown(
                     f"""
-                    <div style="margin-top: 6px; margin-bottom: 6px;">
-                        <span style="background-color: rgba(14, 165, 233, 0.16); border: 1px solid #0284c7; color: #bae6fd; font-size: 0.92rem; font-weight: 700; padding: 3px 10px; border-radius: 6px; display: inline-block;">
+                    <div style="margin-top: 6px; margin-bottom: 8px;">
+                        <span class="badge-tema">
                             📌 <strong>Punto Jurídico:</strong> {tema}
                         </span>
                     </div>
@@ -334,13 +372,13 @@ def main():
                     unsafe_allow_html=True,
                 )
 
-            st.markdown("<hr style='margin: 8px 0 14px 0; border: none; border-top: 1px solid #334155;'/>", unsafe_allow_html=True)
+            st.markdown('<hr class="tarjeta-divider"/>', unsafe_allow_html=True)
 
             # Línea de Precedente / Ratificación (si existe)
             if ratificaciones.strip():
                 st.markdown(
                     f"""
-                    <div style="background-color: rgba(59, 130, 246, 0.12); border-left: 3px solid #60a5fa; border-radius: 4px; padding: 6px 12px; margin-bottom: 12px; color: #93c5fd; font-size: 0.95rem;">
+                    <div class="ratif-box">
                         🔁 <strong>Línea de Precedente / Ratificación:</strong> {ratificaciones}
                     </div>
                     """,
