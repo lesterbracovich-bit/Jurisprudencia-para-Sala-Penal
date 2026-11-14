@@ -123,12 +123,14 @@ def load_data():
         return pd.DataFrame()
 
     conn = sqlite3.connect(DB_PATH)
-    # Asegurar que la columna ratificaciones existe
     cursor = conn.cursor()
     cursor.execute("PRAGMA table_info(sentencias)")
     cols = [c[1] for c in cursor.fetchall()]
     if "ratificaciones" not in cols:
         cursor.execute("ALTER TABLE sentencias ADD COLUMN ratificaciones TEXT")
+        conn.commit()
+    if "tema" not in cols:
+        cursor.execute("ALTER TABLE sentencias ADD COLUMN tema TEXT")
         conn.commit()
 
     query = """
@@ -137,6 +139,7 @@ def load_data():
             numero,
             sala,
             COALESCE(fecha, 'Sin fecha') AS fecha,
+            COALESCE(tema, '') AS tema,
             COALESCE(extracto, '') AS extracto,
             COALESCE(contenido_citado, '') AS contenido_citado,
             COALESCE(ratificaciones, '') AS ratificaciones,
@@ -190,11 +193,53 @@ def main():
             help="Busca coincidencias en el resumen jurídico, la cita textual o el número de sentencia.",
         )
 
+        # ─── Aplicación Inmediata de Filtros ─────────────────────────────────
+        df_filtrado = df.copy()
+
+        # Filtro por sala
+        if sala_seleccionada != "Todas las Salas":
+            df_filtrado = df_filtrado[df_filtrado["sala"] == sala_seleccionada]
+
+        # Filtro por palabra clave
+        if busqueda.strip():
+            termino = busqueda.strip().lower()
+            condicion = (
+                df_filtrado["tema"].str.lower().str.contains(termino, na=False)
+                | df_filtrado["extracto"].str.lower().str.contains(termino, na=False)
+                | df_filtrado["contenido_citado"].str.lower().str.contains(termino, na=False)
+                | df_filtrado["ratificaciones"].str.lower().str.contains(termino, na=False)
+                | df_filtrado["numero"].astype(str).str.lower().str.contains(termino, na=False)
+            )
+            df_filtrado = df_filtrado[condicion]
+
+        # ─── Panel de Resultados en la Barra Lateral ──────────────────────────
+        hay_filtro = bool(busqueda.strip()) or (sala_seleccionada != "Todas las Salas")
+        cant_hallazgos = len(df_filtrado)
+
+        if hay_filtro:
+            if cant_hallazgos > 0:
+                st.success(f"🎯 **{cant_hallazgos}** resultado(s) hallado(s)")
+                with st.expander(f"📋 Lista rápida ({cant_hallazgos})", expanded=True):
+                    for _, r in df_filtrado.iterrows():
+                        num = r["numero"]
+                        s_corta = "Penal" if "Penal" in r["sala"] else ("Const." if "Const" in r["sala"] else r["sala"][:12])
+                        tema_c = f" - *{r['tema'][:26]}...*" if r.get("tema") else ""
+                        st.markdown(f"• **Sent. N° {num}** ({s_corta}){tema_c}")
+            else:
+                st.error("❌ No se hallaron resultados para esta búsqueda.")
+        else:
+            st.caption(f"ℹ️ Mostrando los {cant_hallazgos} extractos registrados.")
+
         st.divider()
 
         # Métricas de la Base de Datos
         st.subheader("📊 Estadísticas")
-        st.metric("Total sentencias registradas", len(df))
+        col_m1, col_m2 = st.columns(2)
+        with col_m1:
+            st.metric("Total Extractos", len(df))
+        with col_m2:
+            sentencias_unicas = len(df.drop_duplicates(subset=["numero", "sala"]))
+            st.metric("Sentencias Únicas", sentencias_unicas)
         
         st.markdown("**Distribución por Sala:**")
         distribucion = df["sala"].value_counts()
@@ -217,28 +262,10 @@ def main():
             unsafe_allow_html=True,
         )
 
-    # ─── Aplicación de Filtros ────────────────────────────────────────────────
-    df_filtrado = df.copy()
-
-    # Filtro por sala
-    if sala_seleccionada != "Todas las Salas":
-        df_filtrado = df_filtrado[df_filtrado["sala"] == sala_seleccionada]
-
-    # Filtro por palabra clave
-    if busqueda.strip():
-        termino = busqueda.strip().lower()
-        condicion = (
-            df_filtrado["extracto"].str.lower().str.contains(termino, na=False)
-            | df_filtrado["contenido_citado"].str.lower().str.contains(termino, na=False)
-            | df_filtrado["ratificaciones"].str.lower().str.contains(termino, na=False)
-            | df_filtrado["numero"].astype(str).str.lower().str.contains(termino, na=False)
-        )
-        df_filtrado = df_filtrado[condicion]
-
-    # Barra informativa de resultados
+    # ─── Barra informativa de resultados (Cabecera principal) ─────────────────
     col_info, col_export = st.columns([3, 1])
     with col_info:
-        st.markdown(f"**Resultados encontrados:** `{len(df_filtrado)}` sentencia(s)")
+        st.markdown(f"**Resultados encontrados:** `{len(df_filtrado)}` extracto(s)")
     with col_export:
         csv_data = df_filtrado.to_csv(index=False, sep=";", encoding="utf-8-sig")
         st.download_button(
@@ -259,6 +286,7 @@ def main():
         numero = row["numero"]
         sala = row["sala"]
         fecha = row["fecha"]
+        tema = row.get("tema", "") or ""
         extracto = row["extracto"]
         contenido_citado = row["contenido_citado"]
         ratificaciones = row.get("ratificaciones", "") or ""
@@ -288,6 +316,19 @@ def main():
                     f"""
                     <div class="fecha-label">
                         📅 <strong>Fecha:</strong> <strong>{fecha}</strong>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+            # Etiqueta de Tema / Punto Jurídico (si está definido)
+            if tema.strip():
+                st.markdown(
+                    f"""
+                    <div style="margin-top: 6px; margin-bottom: 6px;">
+                        <span style="background-color: rgba(14, 165, 233, 0.16); border: 1px solid #0284c7; color: #bae6fd; font-size: 0.92rem; font-weight: 700; padding: 3px 10px; border-radius: 6px; display: inline-block;">
+                            📌 <strong>Punto Jurídico:</strong> {tema}
+                        </span>
                     </div>
                     """,
                     unsafe_allow_html=True,
