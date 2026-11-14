@@ -1,0 +1,46 @@
+name: Mantener Streamlit Activo
+
+on:
+  schedule:
+    - cron: '0 */6 * * *' # Se ejecuta automáticamente cada 6 horas
+  workflow_dispatch:      # Permite probarlo manualmente con un botón
+
+jobs:
+  wake-up:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar navegador Playwright
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+
+      - name: Visitar la app y despertarla si duerme
+        env:
+          APP_URL: 'https://jurisprudencia-para-sala-penal-gnwdevxuyzgv89a6yidpq5.streamlit.app/' # Cambia esto por tu URL real
+        run: |
+          python -c "
+          import os
+          from playwright.sync_api import sync_playwright
+
+          url = os.environ['APP_URL']
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True)
+              page = browser.new_page()
+              page.goto(url, wait_until='networkidle', timeout=60000)
+              page.wait_for_timeout(10000)
+              
+              button = page.get_by_role('button', name='Yes, get this app back up!')
+              if button.is_visible():
+                  print('La app estaba dormida. Reactivando...')
+                  button.click()
+                  page.wait_for_timeout(30000)
+              else:
+                  print('La app ya está despierta. Sesión registrada.')
+              
+              browser.close()
+          "
