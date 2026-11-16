@@ -12,7 +12,6 @@ jobs:
   extraer-jurisprudencia:
     runs-on: ubuntu-latest
     timeout-minutes: 45
-
     steps:
       - name: 1. Descargar repositorio
         uses: actions/checkout@v4
@@ -22,35 +21,18 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: 3. Instalar dependencias del extractor
-        run: |
-          pip install --upgrade pip
-          pip install google-genai beautifulsoup4 requests urllib3 playwright
-          playwright install --with-deps chromium
+      - name: 3. Instalar dependencias
+        run: pip install --upgrade pip google-genai beautifulsoup4 requests urllib3 playwright && playwright install --with-deps chromium
 
-      - name: 4. Ejecutar extractor automático del TSJ
+      - name: 4. Ejecutar extractor del TSJ
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: |
-          if [ -f "extractor_web.py" ]; then
-            python extractor_web.py
-          elif [ -f "extractor web.py" ]; then
-            python "extractor web.py"
-          else
-            python extractor.py
-          fi
+        run: python extractor_web.py
 
-      - name: 5. Guardar cambios en GitHub (BD y CSV)
+      - name: 5. Guardar cambios en GitHub
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
           git add jurisprudencia_ia.db
-          if [ -f "reporte_jurisprudencia.csv" ]; then
-            git add reporte_jurisprudencia.csv
-          fi
-          if git diff --staged --quiet; then
-            echo "Sin cambios en la base de datos."
-          else
-            git commit -m "chore(db): actualización automática de sentencias TSJ ($(date +'%d/%m/%Y'))"
-            git push
-          fi
+          if [ -f reporte_jurisprudencia.csv ]; then git add reporte_jurisprudencia.csv; fi
+          git diff --staged --quiet || (git commit -m "Actualizacion automatica TSJ" && git push)
