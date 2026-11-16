@@ -3,15 +3,14 @@
 """
 Extractor Automático Web del TSJ - Exclusivo para Sentencias de Nulidad Penal
 =============================================================================
-Consulta https://www.tsj.gob.ve/es/web/tsj/decisiones#, filtra decisiones de la
-Sala de Casación Penal y Sala Constitucional (en materia penal) donde se decreten
-NULIDADES, y extrae únicamente los 2 o 3 extractos más relevantes (de la redacción
-propia de la Sala) que expliquen concisamente:
+Navega en https://www.tsj.gob.ve/es/web/tsj/decisiones#5 (Penal) y #1 (Constitucional),
+selecciona el año y hace clic en los círculos verdes de los días publicados dentro del
+rango pendiente (iniciando el 09/09/2026).
+
+Filtra sentencias en materia penal donde se decreten NULIDADES y extrae los 2 o 3
+extractos más relevantes de la redacción propia de la Sala que expliquen concisamente:
   1) Cuál es el vicio que generó la nulidad.
   2) Por qué dicho vicio es considerado lesivo por la Sala.
-
-Guarda el progreso de fechas en SQLite (iniciando el 09/09/2026) para que cada
-ejecución revise desde el día siguiente al de la última corrida.
 """
 
 import csv
@@ -34,10 +33,7 @@ from bs4 import BeautifulSoup
 from google import genai
 from playwright.sync_api import sync_playwright
 
-# Desactivar advertencias SSL para dominios .gob.ve
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-# Forzar flush en todos los print para ver progreso en GitHub Actions en tiempo real
 print = functools.partial(print, flush=True)
 
 # ─── Configuración General ────────────────────────────────────────────────────
@@ -45,19 +41,11 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "jurisprudencia_ia.db")
 CSV_PATH = os.path.join(BASE_DIR, "reporte_jurisprudencia.csv")
 
-TSJ_DECISIONES_URL = "https://www.tsj.gob.ve/es/web/tsj/decisiones#"
 TZ_VENEZUELA = ZoneInfo("America/Caracas")
-
-# Fecha de inicio de la primera extracción (9 de septiembre de 2026)
 FECHA_INICIO_INICIAL = date(2026, 9, 9)
 
-# Límite estricto de máximas por sentencia (2 a 3 extractos)
 MAX_MAXIMAS_POR_SENTENCIA = 3
-
-# Filtro estricto: SOLO analiza sentencias que contengan indicadores de nulidad
 FILTRAR_SOLO_CON_INDICADORES_NULIDAD = True
-
-# Tamaño máximo de texto enviado por sentencia (enfocado en la motiva y dispositiva)
 MAX_CHARS_SENTENCIA = 45_000
 
 API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
@@ -66,6 +54,37 @@ PREFERRED_MODELS = [
     "gemini-3.5-flash-lite",
     "gemini-3.6-flash",
     "gemini-4-hydrogen",
+]
+
+MESES_NOMBRE_A_NUM = {
+    "enero": 1,
+    "febrero": 2,
+    "marzo": 3,
+    "abril": 4,
+    "mayo": 5,
+    "junio": 6,
+    "julio": 7,
+    "agosto": 8,
+    "septiembre": 9,
+    "setiembre": 9,
+    "octubre": 10,
+    "noviembre": 11,
+    "diciembre": 12,
+}
+
+SALAS_OBJETIVO = [
+    {
+        "nombre_bd": "Sala de Casación Penal",
+        "menu_texto": "Penal",
+        "codigo": "scp",
+        "url": "https://www.tsj.gob.ve/es/web/tsj/decisiones#5",
+    },
+    {
+        "nombre_bd": "Sala Constitucional",
+        "menu_texto": "Constitucional",
+        "codigo": "scon",
+        "url": "https://www.tsj.gob.ve/es/web/tsj/decisiones#1",
+    },
 ]
 
 # ─── Palabras Clave de Filtrado Jurídico ──────────────────────────────────────
@@ -123,9 +142,8 @@ KEYWORDS_NULIDAD = [
 ]
 
 
-# ─── Inicialización del cliente Gemini ────────────────────────────────────────
+# ─── Cliente Google AI Studio (Gemini) ────────────────────────────────────────
 def init_client():
-    """Crea e inicializa el cliente de Google GenAI."""
     if not API_KEY:
         print("=" * 60)
         print("❌ ERROR: No se encontró la variable de entorno GEMINI_API_KEY.")
@@ -136,7 +154,6 @@ def init_client():
 
 
 def select_model(client):
-    """Prueba los modelos preferidos y devuelve una tupla (primario, respaldo)."""
     funcionales = []
     for model_name in PREFERRED_MODELS:
         try:
@@ -182,11 +199,6 @@ def select_model(client):
 
 # ─── Base de Datos y Control de Fechas ────────────────────────────────────────
 def init_db():
-    """
-    Inicializa o conecta con jurisprudencia_ia.db conservando intactas las tablas
-    'sentencias' y 'estado_bloques', y añade 'control_fechas_web' para el seguimiento
-    incremental por fecha.
-    """
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
@@ -232,11 +244,6 @@ def init_db():
 
 
 def obtener_rango_fechas(conn):
-    """
-    Obtiene el rango [fecha_inicio, fecha_fin] a revisar.
-    - Si es la primera ejecución, inicia el 09/09/2026.
-    - En ejecuciones posteriores, inicia el día siguiente a 'ultima_fecha_revisada'.
-    """
     hoy_ve = datetime.now(TZ_VENEZUELA).date()
     cursor = conn.cursor()
     cursor.execute("SELECT ultima_fecha_revisada FROM control_fechas_web WHERE id = 1")
@@ -252,7 +259,6 @@ def obtener_rango_fechas(conn):
 
 
 def actualizar_ultima_fecha_revisada(conn, fecha_obj):
-    """Guarda en la BD la última fecha revisada exitosamente (formato YYYY-MM-DD)."""
     ahora_str = datetime.now(TZ_VENEZUELA).strftime("%Y-%m-%d %H:%M:%S")
     fecha_str = fecha_obj.strftime("%Y-%m-%d")
     cursor = conn.cursor()
@@ -267,7 +273,6 @@ def actualizar_ultima_fecha_revisada(conn, fecha_obj):
 
 
 def url_ya_procesada(conn, identificador_origen):
-    """Verifica en estado_bloques si una sentencia web ya fue procesada con éxito."""
     cursor = conn.cursor()
     cursor.execute(
         "SELECT 1 FROM estado_bloques WHERE archivo = ? AND estado = 'EXITOSO' LIMIT 1",
@@ -277,7 +282,6 @@ def url_ya_procesada(conn, identificador_origen):
 
 
 def guardar_estado_bloque(conn, archivo, estado, sentencias_detectadas=0, error_detalle=""):
-    """Registra el estado de procesamiento de la sentencia web en estado_bloques."""
     ahora_str = datetime.now(TZ_VENEZUELA).strftime("%Y-%m-%d %H:%M:%S")
     cursor = conn.cursor()
     cursor.execute("""
@@ -382,7 +386,6 @@ def limpiar_y_validar_registro(s):
     if any(frase in citado_lower for frase in FRASES_INVALIDAS):
         return None
 
-    # Filtro anti-citas textuales de otros fallos
     patrones_cita_ajena = [
         r"en\s+sentencia\s+n[°ºo.]?\s*\d+.*?(?:estableci[óo]|se[ñn]al[óo]|indic[óo]|dej[óo]\s+sentado)\s*:",
         r"al\s+respecto\s*,?\s*la\s+sala\s+.*?en\s+decisi[óo]n\s+n[°ºo.]?\s*\d+.*?expres[óo]\s*:",
@@ -403,7 +406,6 @@ def limpiar_y_validar_registro(s):
 
 
 def insert_sentencias(conn, sentencias, archivo_origen):
-    """Inserta hasta MAX_MAXIMAS_POR_SENTENCIA extractos validados en la tabla sentencias."""
     cursor = conn.cursor()
     inserted = 0
     updated = 0
@@ -484,21 +486,14 @@ def insert_sentencias(conn, sentencias, archivo_origen):
     return inserted, updated, duplicated
 
 
-# ─── Scraping del Portal TSJ (Playwright + Descarga de Fallos) ────────────────
-SALAS_OBJETIVO = [
-    {"nombre": "Sala de Casación Penal", "codigo": "scp", "hash": "#5"},
-    {"nombre": "Sala Constitucional", "codigo": "scon", "hash": "#1"},
-]
-
-
+# ─── Scraping del Portal TSJ (Calendario de Círculos Verdes por Mes) ──────────
 def descargar_texto_sentencia(url):
-    """Descarga el HTML completo de la sentencia desde historico.tsj.gob.ve."""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
     }
     for intento in range(1, 4):
         try:
-            resp = requests.get(url, headers=headers, verify=False, timeout=25)
+            resp = requests.get(url, headers=headers, verify=False, timeout=30)
             if resp.status_code != 200:
                 continue
             raw_bytes = resp.content
@@ -522,7 +517,6 @@ def descargar_texto_sentencia(url):
 
 
 def extraer_metadatos_cabecera(texto, url, sala_nombre, fecha_obj):
-    """Intenta identificar el número de sentencia desde la URL o el texto del fallo."""
     numero = ""
     m_url = re.search(r"/\d+-([A-Za-z.]*0*\d+)-\d{5,6}-\d{4}", url)
     if m_url:
@@ -590,100 +584,231 @@ def recortar_seccion_relevante(texto):
     return f"{encabezado}\n\n[...DESARROLLO Y DECISIÓN DEL FALLO...]\n\n{cierre}"
 
 
+def cargar_pagina_tsj_con_reintentos(page, url, menu_texto):
+    """Carga la página del TSJ asegurando que el portlet de decisiones se renderice."""
+    for intento in range(1, 4):
+        try:
+            print(f"    🔄 Cargando {url} (intento {intento}/3)...")
+            page.goto(url, timeout=90000, wait_until="domcontentloaded")
+            # Esperar a que aparezca el menú lateral o el calendario de meses
+            page.wait_for_selector("text=Seleccione un Año", timeout=45000)
+
+            # Hacer clic explícito en el enlace de la Sala en el menú lateral ("Penal" o "Constitucional")
+            enlace_sala = page.locator(f"a:text-is('{menu_texto}')").first
+            if enlace_sala.count() > 0:
+                enlace_sala.click(timeout=10000)
+                page.wait_for_timeout(2500)
+
+            return True
+        except Exception as e:
+            print(f"    ⚠ Intento {intento} sin respuesta completa: {str(e)[:90]}")
+            time.sleep(5)
+    return False
+
+
+def obtener_dias_publicados_en_vista(page, anio_objetivo):
+    """
+    Lee la tabla de meses ('Enero' .. 'Diciembre') y los círculos verdes visibles en pantalla.
+    Devuelve una lista de tuplas: [(date_obj, mes_texto, dia_texto), ...]
+    """
+    datos_dom = page.evaluate("""() => {
+        const mesesValid = [
+            'enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio',
+            'julio', 'agosto', 'septiembre', 'setiembre', 'octubre', 'noviembre', 'diciembre'
+        ];
+        const hallados = [];
+        // Buscar filas o contenedores donde aparezca el nombre de cada mes
+        const candidatos = Array.from(document.querySelectorAll('tr, div, li'));
+        for (const cont of candidatos) {
+            const textoDirecto = (cont.innerText || '').trim();
+            if (!textoDirecto || textoDirecto.length > 250) continue;
+            const lineas = textoDirecto.split(/\\n+/).map(s => s.trim()).filter(Boolean);
+            if (lineas.length < 2) continue;
+            const posibleMes = lineas[0].toLowerCase();
+            if (!mesesValid.includes(posibleMes)) continue;
+
+            // Los demás tokens numéricos de 2 dígitos (01..31) son los círculos verdes de días
+            const dias = [];
+            for (let i = 1; i < lineas.length; i++) {
+                const tok = lineas[i];
+                if (/^(0?[1-9]|[12][0-9]|3[01])$/.test(tok)) {
+                    dias.push(tok);
+                }
+            }
+            if (dias.length > 0) {
+                hallados.push({ mes_original: lineas[0], mes_lower: posibleMes, dias: dias });
+            }
+        }
+        return hallados;
+    }""")
+
+    resultado = []
+    vistos = set()
+    for item in datos_dom:
+        mes_num = MESES_NOMBRE_A_NUM.get(item["mes_lower"])
+        if not mes_num:
+            continue
+        for d_str in item["dias"]:
+            try:
+                f_obj = date(anio_objetivo, mes_num, int(d_str))
+                if f_obj not in vistos:
+                    vistos.add(f_obj)
+                    resultado.append((f_obj, item["mes_original"], d_str))
+            except ValueError:
+                continue
+
+    return sorted(resultado, key=lambda x: x[0])
+
+
 def buscar_decisiones_en_portal_tsj(fecha_inicio, fecha_fin):
+    """
+    Abre el calendario de círculos verdes de Sala Penal (#5) y Sala Constitucional (#1),
+    filtra los días publicados dentro de [fecha_inicio, fecha_fin], hace clic en cada día
+    y recolecta las URLs de las sentencias publicadas.
+    Retorna (resultados_por_fecha, portal_accesible).
+    """
     resultados_por_fecha = {}
-    fechas_a_consultar = []
-    curr = fecha_inicio
-    while curr <= fecha_fin:
-        fechas_a_consultar.append(curr)
-        resultados_por_fecha[curr] = []
-        curr += timedelta(days=1)
+    anios_necesarios = sorted({y for y in range(fecha_inicio.year, fecha_fin.year + 1)})
+    portal_accesible = False
 
-    if not fechas_a_consultar:
-        return resultados_por_fecha
-
-    print(f"\n🌐 Conectando con {TSJ_DECISIONES_URL} ...")
+    print("\n🌐 Iniciando navegador headless para consultar el portal del TSJ...")
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-http2",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        )
         context = browser.new_context(
             ignore_https_errors=True,
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+            viewport={"width": 1366, "height": 900},
         )
         page = context.new_page()
 
+        # Bloquear imágenes, audios y fuentes para acelerar drásticamente la carga desde GitHub
+        page.route(
+            "**/*",
+            lambda route: route.abort()
+            if route.request.resource_type in {"image", "media", "font"}
+            else route.continue_(),
+        )
+
         for sala_info in SALAS_OBJETIVO:
-            sala_nombre = sala_info["nombre"]
+            sala_nombre = sala_info["nombre_bd"]
+            menu_texto = sala_info["menu_texto"]
             codigo_sala = sala_info["codigo"]
-            print(f"\n🏛️  Consultando {sala_nombre}...")
+            url_sala = sala_info["url"]
 
-            try:
-                page.goto(f"https://www.tsj.gob.ve/es/web/tsj/decisiones{sala_info['hash']}", timeout=45000, wait_until="domcontentloaded")
-                page.wait_for_timeout(2000)
+            print(f"\n🏛️  Consultando {sala_nombre} ({url_sala})...")
+            cargo = cargar_pagina_tsj_con_reintentos(page, url_sala, menu_texto)
+            if not cargo:
+                print(f"    ❌ No fue posible conectar con {sala_nombre} tras 3 intentos.")
+                continue
 
-                locator_sala = page.locator(f"a:has-text('{sala_nombre}')").first
-                if locator_sala.count() > 0:
-                    locator_sala.click(timeout=5000)
-                    page.wait_for_timeout(1500)
-            except Exception as e:
-                print(f"    ⚠ Aviso al cargar pestaña de {sala_nombre}: {e}")
+            portal_accesible = True
 
-            for f_obj in fechas_a_consultar:
-                fecha_ddmmyyyy = f_obj.strftime("%d/%m/%Y")
-                fecha_corta_url = f"{f_obj.day}{f_obj.month}{str(f_obj.year)[-2:]}"
-
-                enlaces_dia = {}
-
+            for anio in anios_necesarios:
+                # Seleccionar el año en el desplegable "Años" si es necesario
                 try:
-                    inputs_fecha = page.locator("input[type='text'], input[name*='fecha'], input[id*='fecha'], input.hasDatepicker")
-                    if inputs_fecha.count() > 0:
-                        inp = inputs_fecha.first
-                        inp.fill(fecha_ddmmyyyy)
-                        inp.press("Enter")
-                        page.wait_for_timeout(1500)
+                    select_anio = page.locator("select").first
+                    if select_anio.count() > 0:
+                        valor_actual = select_anio.input_value()
+                        if str(anio) not in str(valor_actual):
+                            select_anio.select_option(label=str(anio))
+                            page.wait_for_timeout(2500)
+                except Exception as e:
+                    print(f"    ⚠ Aviso seleccionando año {anio}: {e}")
 
-                    btn_buscar = page.locator("button:has-text('Buscar'), input[type='submit'][value*='Buscar'], a:has-text('Consultar')")
-                    if btn_buscar.count() > 0:
-                        btn_buscar.first.click(timeout=3000)
-                        page.wait_for_timeout(1500)
+                dias_disponibles = obtener_dias_publicados_en_vista(page, anio)
+                dias_en_rango = [
+                    (f_obj, mes_txt, dia_txt)
+                    for (f_obj, mes_txt, dia_txt) in dias_disponibles
+                    if fecha_inicio <= f_obj <= fecha_fin
+                ]
 
-                    html_actual = page.content()
-                    soup = BeautifulSoup(html_actual, "html.parser")
+                print(f"    📆 Año {anio}: {len(dias_disponibles)} día(s) con publicaciones totales | {len(dias_en_rango)} dentro del rango buscado.")
 
-                    for a_tag in soup.find_all("a", href=True):
-                        href = a_tag["href"].strip()
-                        if f"/decisiones/{codigo_sala}/" not in href.lower():
-                            continue
+                for f_obj, mes_txt, dia_txt in dias_en_rango:
+                    fecha_ddmmyyyy = f_obj.strftime("%d/%m/%Y")
+                    resultados_por_fecha.setdefault(f_obj, [])
 
-                        full_url = urljoin("https://historico.tsj.gob.ve", href)
-                        contenedor = a_tag.find_parent(["li", "tr", "div", "p"])
-                        resumen_texto = contenedor.get_text(" ", strip=True) if contenedor else a_tag.get_text(" ", strip=True)
-
-                        nombre_archivo = full_url.split("/")[-1].lower()
-                        coincide_fecha_url = (
-                            f"-{fecha_corta_url}-" in nombre_archivo
-                            or f"-0{fecha_corta_url}-" in nombre_archivo
-                            or fecha_ddmmyyyy in resumen_texto
-                            or f_obj.strftime("%d-%m-%Y") in resumen_texto
+                    try:
+                        # Guardar enlaces previos para detectar los nuevos que cargue el clic
+                        hrefs_antes = set(
+                            page.evaluate(
+                                f"() => Array.from(document.querySelectorAll('a[href*=\"/decisiones/{codigo_sala}/\"]')).map(a => a.href)"
+                            )
                         )
 
-                        if coincide_fecha_url and full_url not in enlaces_dia:
-                            enlaces_dia[full_url] = {
-                                "url": full_url,
-                                "sala": sala_nombre,
-                                "fecha": f_obj,
-                                "resumen": resumen_texto,
-                            }
+                        # Hacer clic en el círculo verde del día dentro de la fila del mes correspondiente
+                        clic_realizado = page.evaluate(
+                            """([mesTarget, diaTarget]) => {
+                                const contenedores = Array.from(document.querySelectorAll('tr, div, li'));
+                                for (const cont of contenedores) {
+                                    const txt = (cont.innerText || '').trim();
+                                    if (!txt || txt.length > 250) continue;
+                                    const lineas = txt.split(/\\n+/).map(s => s.trim()).filter(Boolean);
+                                    if (lineas.length < 2) continue;
+                                    if (lineas[0].toLowerCase() !== mesTarget.toLowerCase()) continue;
 
-                except Exception as e:
-                    print(f"    ⚠ Aviso consultando {fecha_ddmmyyyy} ({sala_nombre}): {e}")
+                                    const clickables = Array.from(cont.querySelectorAll('a, button, span, div'));
+                                    for (const el of clickables) {
+                                        if ((el.innerText || '').trim() === diaTarget && el.children.length === 0) {
+                                            el.click();
+                                            return true;
+                                        }
+                                    }
+                                }
+                                return false;
+                            }""",
+                            [mes_txt, dia_txt],
+                        )
 
-                if enlaces_dia:
-                    print(f"    📅 {fecha_ddmmyyyy}: {len(enlaces_dia)} decisión(es) detectada(s) en {sala_nombre}")
-                    resultados_por_fecha[f_obj].extend(enlaces_dia.values())
+                        if not clic_realizado:
+                            print(f"      ⚠ No se pudo hacer clic en {mes_txt} {dia_txt}")
+                            continue
+
+                        # Esperar a que aparezcan los enlaces de las decisiones de ese día
+                        enlaces_dia = {}
+                        for _ in range(12):
+                            page.wait_for_timeout(1000)
+                            items_dom = page.evaluate(
+                                f"""() => {{
+                                    return Array.from(document.querySelectorAll('a[href*="/decisiones/{codigo_sala}/"]')).map(a => {{
+                                        const box = a.closest('tr, li, div');
+                                        return {{
+                                            href: a.href,
+                                            resumen: box ? box.innerText.replace(/\\s+/g, ' ').trim() : a.innerText.trim()
+                                        }};
+                                    }});
+                                }}"""
+                            )
+                            nuevos = [it for it in items_dom if it["href"] not in hrefs_antes]
+                            if nuevos or (items_dom and not hrefs_antes):
+                                lista_usar = nuevos if nuevos else items_dom
+                                for it in lista_usar:
+                                    full_url = urljoin("https://historico.tsj.gob.ve", it["href"])
+                                    enlaces_dia[full_url] = {
+                                        "url": full_url,
+                                        "sala": sala_nombre,
+                                        "fecha": f_obj,
+                                        "resumen": it["resumen"],
+                                    }
+                                break
+
+                        print(f"      📅 {fecha_ddmmyyyy} ({mes_txt} {dia_txt}): {len(enlaces_dia)} sentencia(s) encontrada(s)")
+                        resultados_por_fecha[f_obj].extend(enlaces_dia.values())
+
+                    except Exception as e:
+                        print(f"      ⚠ Error leyendo día {fecha_ddmmyyyy}: {e}")
 
         browser.close()
 
-    return resultados_por_fecha
+    return resultados_por_fecha, portal_accesible
 
 
 # ─── Prompt Exclusivo para Vicios de Nulidad y su Lesividad ───────────────────
@@ -817,23 +942,32 @@ def main():
     print(f"🕒 Fecha actual (Venezuela): {fecha_fin.strftime('%d/%m/%Y')}")
     if fecha_inicio > fecha_fin:
         print(f"✨ La base de datos ya está al día (última revisión: {(fecha_inicio - timedelta(days=1)).strftime('%d/%m/%Y')}).")
+        export_csv(conn)
         conn.close()
         return
 
     print(f"📅 Rango de revisión programado: {fecha_inicio.strftime('%d/%m/%Y')} -> {fecha_fin.strftime('%d/%m/%Y')}")
 
-    # 1) Buscar decisiones publicadas en el portal del TSJ por cada día del rango
-    decisiones_por_dia = buscar_decisiones_en_portal_tsj(fecha_inicio, fecha_fin)
-    total_halladas = sum(len(lista) for lista in decisiones_por_dia.values())
+    # 1) Buscar decisiones publicadas en el calendario de círculos verdes del TSJ
+    decisiones_por_dia, portal_accesible = buscar_decisiones_en_portal_tsj(fecha_inicio, fecha_fin)
 
-    if total_halladas == 0:
-        print("\nℹ️  No se hallaron sentencias publicadas en el rango consultado.")
-        actualizar_ultima_fecha_revisada(conn, fecha_fin)
-        print(f"✔  Fecha de control actualizada a: {fecha_fin.strftime('%Y-%m-%d')}")
+    if not portal_accesible:
+        print("\n⚠️  El portal del TSJ no respondió desde el servidor. No se modificará la fecha de control para reintentar luego.")
+        export_csv(conn)
         conn.close()
         return
 
-    # 2) Inicializar cliente Gemini solo si hay sentencias que analizar
+    total_halladas = sum(len(lista) for lista in decisiones_por_dia.values())
+
+    if total_halladas == 0:
+        print("\nℹ️  No se hallaron sentencias publicadas en los días del rango consultado.")
+        actualizar_ultima_fecha_revisada(conn, fecha_fin)
+        print(f"✔  Fecha de control actualizada a: {fecha_fin.strftime('%Y-%m-%d')}")
+        export_csv(conn)
+        conn.close()
+        return
+
+    # 2) Inicializar cliente Gemini
     print("\n🤖 Inicializando conexión con Google AI Studio (Gemini)...")
     client = init_client()
     primary_model, fallback_model = select_model(client)
@@ -843,11 +977,11 @@ def main():
     total_updated = 0
     total_duplicated = 0
 
-    # 3) Procesar día por día en orden cronológico y actualizar el puntero de fecha
+    # 3) Procesar día por día en orden cronológico
+    todo_sin_errores_ia = True
     for dia_actual in sorted(decisiones_por_dia.keys()):
         items_dia = decisiones_por_dia[dia_actual]
         if not items_dia:
-            actualizar_ultima_fecha_revisada(conn, dia_actual)
             continue
 
         print(f"\n{'─' * 65}")
@@ -886,7 +1020,6 @@ def main():
 
         candidatas_dia.sort(key=lambda x: x["score_nulidad"], reverse=True)
 
-        dia_sin_errores_ia = True
         for meta in candidatas_dia:
             print(f"  🔥 [CANDIDATA NULIDAD] Analizando {meta['sala']} | Sentencia N° {meta['numero'] or '?'} ({meta['url']})...", end=" ")
 
@@ -909,14 +1042,15 @@ def main():
                 else:
                     print("✔ (Descartada tras lectura IA: no decreta nulidad)")
             else:
-                dia_sin_errores_ia = False
+                todo_sin_errores_ia = False
                 guardar_estado_bloque(conn, meta["url"], "ERROR", 0, error_msg)
                 print(f"✘ Error IA: {error_msg[:60]}")
 
             time.sleep(3)
 
-        if dia_sin_errores_ia:
-            actualizar_ultima_fecha_revisada(conn, dia_actual)
+    if todo_sin_errores_ia:
+        actualizar_ultima_fecha_revisada(conn, fecha_fin)
+        print(f"\n✔ Fecha de control actualizada a: {fecha_fin.strftime('%Y-%m-%d')}")
 
     # 4) Exportar CSV y mostrar resumen
     total_ext, sent_unicas = count_sentencias(conn)
@@ -928,7 +1062,7 @@ def main():
     print(f"{'=' * 65}")
     print(f"  ✅ Extractos de nulidad nuevos: {total_inserted}")
     print(f"  📝 Extractos enriquecidos:      {total_updated}")
-    print(f"  🔄 Duplicados omitidos:         {total_duplicated}")
+    print(f"  🔄 Duplicados omitidas:         {total_duplicated}")
     print(f"  📋 Total extractos en BD:       {total_ext} ({sent_unicas} sentencias únicas)")
     print(f"{'=' * 65}")
 
