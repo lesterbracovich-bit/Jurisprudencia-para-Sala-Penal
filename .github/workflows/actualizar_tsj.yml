@@ -1,0 +1,49 @@
+name: Actualizar Jurisprudencia TSJ
+
+on:
+  schedule:
+    # Lunes y Viernes a las 23:00 hora de Venezuela (03:00 UTC del Martes [2] y Sábado [6])
+    - cron: '0 3 * * 2,6'
+  workflow_dispatch: # Permite ejecutarlo manualmente desde la pestaña Actions
+
+permissions:
+  contents: write # Permiso necesario para guardar jurisprudencia_ia.db en el repo
+
+jobs:
+  extraer-jurisprudencia:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: 1. Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: 2. Configurar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 3. Instalar dependencias del extractor
+        run: |
+          pip install --upgrade pip
+          pip install google-genai beautifulsoup4 requests urllib3 playwright
+          playwright install --with-deps chromium
+
+      - name: 4. Ejecutar extractor automático del TSJ
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          python extractor.py
+
+      - name: 5. Guardar cambios en GitHub (BD y CSV)
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add jurisprudencia_ia.db reporte_jurisprudencia.csv
+          if git diff --staged --quiet; then
+            echo "Sin cambios en la base de datos."
+          else
+            git commit -m "chore(db): actualización automática de sentencias TSJ ($(date +'%d/%m/%Y'))"
+            git push
+          fi
