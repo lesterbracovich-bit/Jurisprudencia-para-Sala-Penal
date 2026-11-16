@@ -41,17 +41,17 @@ jobs:
           else
             python extractor.py
           fi
-- name: 5. Guardar cambios en GitHub (BD y CSV)
-        run: |
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
-          git add jurisprudencia_ia.db
-          if [ -f "reporte_jurisprudencia.csv" ]; then
-            git add reporte_jurisprudencia.csv
-          fi
-          if git diff --staged --quiet; then
-            echo "Sin cambios en la base de datos."
-          else
-            git commit -m "chore(db): actualización automática de sentencias TSJ ($(date +'%d/%m/%Y'))"
-            git push
-          fi
+    - name: 5. Guardar cambios en GitHub (BD y CSV)
+          run: |
+            git config --local user.email "github-actions[bot]@users.noreply.github.com"
+            git config --local user.name "github-actions[bot]"
+            git add jurisprudencia_ia.db
+            if [ -f "reporte_jurisprudencia.csv" ]; then
+              git add reporte_jurisprudencia.csv
+            fi
+            if git diff --staged --quiet; then
+              echo "Sin cambios en la base de datos."
+            else
+              git commit -m "chore(db): actualización automática de sentencias TSJ ($(date +'%d/%m/%Y'))"
+              git push
+            fi
