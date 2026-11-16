@@ -41,8 +41,7 @@ jobs:
           else
             python extractor.py
           fi
-
-     - name: 5. Guardar cambios en GitHub (BD y CSV)
+- name: 5. Guardar cambios en GitHub (BD y CSV)
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
