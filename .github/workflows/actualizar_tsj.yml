@@ -4,10 +4,10 @@ on:
   schedule:
     # Lunes y Viernes a las 23:00 hora de Venezuela (03:00 UTC del Martes [2] y Sábado [6])
     - cron: '0 3 * * 2,6'
-  workflow_dispatch: # Permite ejecutarlo manualmente desde la pestaña Actions
+  workflow_dispatch:
 
 permissions:
-  contents: write # Permiso necesario para guardar jurisprudencia_ia.db en el repo
+  contents: write
 
 jobs:
   extraer-jurisprudencia:
@@ -22,7 +22,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
 
       - name: 3. Instalar dependencias del extractor
         run: |
@@ -41,17 +40,18 @@ jobs:
           else
             python extractor.py
           fi
-    - name: 5. Guardar cambios en GitHub (BD y CSV)
-          run: |
-            git config --local user.email "github-actions[bot]@users.noreply.github.com"
-            git config --local user.name "github-actions[bot]"
-            git add jurisprudencia_ia.db
-            if [ -f "reporte_jurisprudencia.csv" ]; then
-              git add reporte_jurisprudencia.csv
-            fi
-            if git diff --staged --quiet; then
-              echo "Sin cambios en la base de datos."
-            else
-              git commit -m "chore(db): actualización automática de sentencias TSJ ($(date +'%d/%m/%Y'))"
-              git push
-            fi
+
+      - name: 5. Guardar cambios en GitHub (BD y CSV)
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add jurisprudencia_ia.db
+          if [ -f "reporte_jurisprudencia.csv" ]; then
+            git add reporte_jurisprudencia.csv
+          fi
+          if git diff --staged --quiet; then
+            echo "Sin cambios en la base de datos."
+          else
+            git commit -m "chore(db): actualización automática de sentencias TSJ ($(date +'%d/%m/%Y'))"
+            git push
+          fi
