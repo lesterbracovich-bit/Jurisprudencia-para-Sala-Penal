@@ -63,10 +63,9 @@ MAX_CHARS_SENTENCIA = 45_000
 API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 
 PREFERRED_MODELS = [
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
     "gemini-3.5-flash-lite",
     "gemini-3.6-flash",
+    "gemini-4-hydrogen",
 ]
 
 # ─── Palabras Clave de Filtrado Jurídico ──────────────────────────────────────
