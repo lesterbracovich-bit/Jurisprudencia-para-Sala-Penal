@@ -34,7 +34,13 @@ jobs:
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
-          python extractor.py
+          if [ -f "extractor_web.py" ]; then
+            python extractor_web.py
+          elif [ -f "extractor web.py" ]; then
+            python "extractor web.py"
+          else
+            python extractor.py
+          fi
 
       - name: 5. Guardar cambios en GitHub (BD y CSV)
         run: |
