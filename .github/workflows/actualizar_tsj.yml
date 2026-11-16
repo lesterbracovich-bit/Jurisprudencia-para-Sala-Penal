@@ -2,7 +2,6 @@ name: Actualizar Jurisprudencia TSJ
 
 on:
   schedule:
-    # Lunes y Viernes a las 23:00 hora de Venezuela (03:00 UTC del Martes [2] y Sábado [6])
     - cron: '0 3 * * 2,6'
   workflow_dispatch:
 
