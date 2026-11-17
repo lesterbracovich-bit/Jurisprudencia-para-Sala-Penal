@@ -2,6 +2,7 @@ name: Actualizar Jurisprudencia TSJ
 
 on:
   schedule:
+    # Lunes y Viernes a las 23:00 hora de Venezuela (03:00 UTC del Martes [2] y Sábado [6])
     - cron: '0 3 * * 2,6'
   workflow_dispatch:
 
@@ -10,30 +11,33 @@ permissions:
 
 jobs:
   extraer-jurisprudencia:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     timeout-minutes: 45
     steps:
       - name: 1. Descargar repositorio
         uses: actions/checkout@v4
 
-      - name: 2. Configurar Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: 3. Instalar dependencias
-        run: pip install --upgrade pip google-genai beautifulsoup4 requests urllib3 playwright && playwright install --with-deps chromium
-
-      - name: 4. Ejecutar extractor del TSJ
+      - name: 2. Ejecutar extractor del TSJ en PC local
+        shell: powershell
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          TSJ_PROXY_URL: ${{ secrets.TSJ_PROXY_URL }}
-        run: python extractor_web.py
+          PYTHONIOENCODING: utf-8
+        run: python -u extractor_web.py
 
-      - name: 5. Guardar cambios en GitHub
+      - name: 3. Guardar cambios en GitHub
+        shell: powershell
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
           git add jurisprudencia_ia.db
-          if [ -f reporte_jurisprudencia.csv ]; then git add reporte_jurisprudencia.csv; fi
-          git diff --staged --quiet || (git commit -m "Actualizacion automatica TSJ" && git push)
+          if (Test-Path "reporte_jurisprudencia.csv") {
+            git add reporte_jurisprudencia.csv
+          }
+          $cambios = git status --porcelain
+          if ($cambios) {
+            $fecha = Get-Date -Format "dd/MM/yyyy HH:mm"
+            git commit -m "chore(db): actualizacion automatica TSJ ($fecha)"
+            git push
+          } else {
+            Write-Host "Sin cambios nuevos en la base de datos."
+          }
