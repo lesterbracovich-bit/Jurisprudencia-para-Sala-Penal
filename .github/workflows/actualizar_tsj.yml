@@ -23,7 +23,9 @@ jobs:
           PYTHONIOENCODING: utf-8
           PLAYWRIGHT_BROWSERS_PATH: C:\Users\Usuario\AppData\Local\ms-playwright
         run: |
-          python -u extractor_web.py
+          for /f "delims=" %%i in ('where python') do set "PYTHON_PATH=%%i"
+          if "%PYTHON_PATH%"=="" set "PYTHON_PATH=C:\Users\Usuario\AppData\Local\Programs\Python\Python311\python.exe"
+          "%PYTHON_PATH%" -u extractor_web.py
 
       - name: 3. Guardar cambios en GitHub
         shell: cmd
