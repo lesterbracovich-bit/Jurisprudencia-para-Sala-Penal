@@ -27,6 +27,7 @@ jobs:
       - name: 4. Ejecutar extractor del TSJ
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TSJ_PROXY_URL: ${{ secrets.TSJ_PROXY_URL }}
         run: python extractor_web.py
 
       - name: 5. Guardar cambios en GitHub
