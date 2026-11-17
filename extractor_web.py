@@ -3,9 +3,9 @@
 """
 Extractor Automático Web del TSJ - Exclusivo para Sentencias de Nulidad Penal
 =============================================================================
-Navega en https://www.tsj.gob.ve/es/web/tsj/decisiones#5 (Penal) y #1 (Constitucional),
-selecciona el año y hace clic en los círculos verdes de los días publicados dentro del
-rango pendiente (iniciando el 09/09/2026).
+Navega en https://www.tsj.gob.ve/es/web/tsj/decisiones#5 (Penal) y #1 (Constitucional)
+usando el proxy configurado en TSJ_PROXY_URL, selecciona el año y hace clic en los
+círculos verdes de los días publicados dentro del rango pendiente (iniciando el 09/09/2026).
 
 Filtra sentencias en materia penal donde se decreten NULIDADES y extrae los 2 o 3
 extractos más relevantes de la redacción propia de la Sala que expliquen concisamente:
@@ -49,6 +49,7 @@ FILTRAR_SOLO_CON_INDICADORES_NULIDAD = True
 MAX_CHARS_SENTENCIA = 45_000
 
 API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+PROXY_URL = os.environ.get("TSJ_PROXY_URL", "").strip()
 
 PREFERRED_MODELS = [
     "gemini-3.5-flash-lite",
@@ -486,14 +487,16 @@ def insert_sentencias(conn, sentencias, archivo_origen):
     return inserted, updated, duplicated
 
 
-# ─── Scraping del Portal TSJ (Calendario de Círculos Verdes por Mes) ──────────
+# ─── Scraping del Portal TSJ (con soporte de Proxy y Calendario) ──────────────
 def descargar_texto_sentencia(url):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
     }
+    proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
+
     for intento in range(1, 4):
         try:
-            resp = requests.get(url, headers=headers, verify=False, timeout=30)
+            resp = requests.get(url, headers=headers, proxies=proxies, verify=False, timeout=45)
             if resp.status_code != 200:
                 continue
             raw_bytes = resp.content
@@ -512,7 +515,7 @@ def descargar_texto_sentencia(url):
         except Exception as e:
             if intento == 3:
                 print(f"      ⚠ Error descargando {url}: {e}")
-            time.sleep(2)
+            time.sleep(3)
     return ""
 
 
@@ -585,39 +588,31 @@ def recortar_seccion_relevante(texto):
 
 
 def cargar_pagina_tsj_con_reintentos(page, url, menu_texto):
-    """Carga la página del TSJ asegurando que el portlet de decisiones se renderice."""
     for intento in range(1, 4):
         try:
             print(f"    🔄 Cargando {url} (intento {intento}/3)...")
-            page.goto(url, timeout=90000, wait_until="domcontentloaded")
-            # Esperar a que aparezca el menú lateral o el calendario de meses
-            page.wait_for_selector("text=Seleccione un Año", timeout=45000)
+            page.goto(url, timeout=120000, wait_until="domcontentloaded")
+            page.wait_for_selector("text=Seleccione un Año", timeout=60000)
 
-            # Hacer clic explícito en el enlace de la Sala en el menú lateral ("Penal" o "Constitucional")
             enlace_sala = page.locator(f"a:text-is('{menu_texto}')").first
             if enlace_sala.count() > 0:
-                enlace_sala.click(timeout=10000)
-                page.wait_for_timeout(2500)
+                enlace_sala.click(timeout=15000)
+                page.wait_for_timeout(3000)
 
             return True
         except Exception as e:
-            print(f"    ⚠ Intento {intento} sin respuesta completa: {str(e)[:90]}")
+            print(f"    ⚠ Intento {intento} sin respuesta completa: {str(e)[:100]}")
             time.sleep(5)
     return False
 
 
 def obtener_dias_publicados_en_vista(page, anio_objetivo):
-    """
-    Lee la tabla de meses ('Enero' .. 'Diciembre') y los círculos verdes visibles en pantalla.
-    Devuelve una lista de tuplas: [(date_obj, mes_texto, dia_texto), ...]
-    """
     datos_dom = page.evaluate("""() => {
         const mesesValid = [
             'enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio',
             'julio', 'agosto', 'septiembre', 'setiembre', 'octubre', 'noviembre', 'diciembre'
         ];
         const hallados = [];
-        // Buscar filas o contenedores donde aparezca el nombre de cada mes
         const candidatos = Array.from(document.querySelectorAll('tr, div, li'));
         for (const cont of candidatos) {
             const textoDirecto = (cont.innerText || '').trim();
@@ -627,7 +622,6 @@ def obtener_dias_publicados_en_vista(page, anio_objetivo):
             const posibleMes = lineas[0].toLowerCase();
             if (!mesesValid.includes(posibleMes)) continue;
 
-            // Los demás tokens numéricos de 2 dígitos (01..31) son los círculos verdes de días
             const dias = [];
             for (let i = 1; i < lineas.length; i++) {
                 const tok = lineas[i];
@@ -661,27 +655,29 @@ def obtener_dias_publicados_en_vista(page, anio_objetivo):
 
 
 def buscar_decisiones_en_portal_tsj(fecha_inicio, fecha_fin):
-    """
-    Abre el calendario de círculos verdes de Sala Penal (#5) y Sala Constitucional (#1),
-    filtra los días publicados dentro de [fecha_inicio, fecha_fin], hace clic en cada día
-    y recolecta las URLs de las sentencias publicadas.
-    Retorna (resultados_por_fecha, portal_accesible).
-    """
     resultados_por_fecha = {}
     anios_necesarios = sorted({y for y in range(fecha_inicio.year, fecha_fin.year + 1)})
     portal_accesible = False
 
-    print("\n🌐 Iniciando navegador headless para consultar el portal del TSJ...")
+    if PROXY_URL:
+        print(f"\n🔌 Conectando mediante proxy configurado: {PROXY_URL}")
+    else:
+        print("\n🌐 Iniciando navegador headless sin proxy...")
+
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
+        launch_kwargs = {
+            "headless": True,
+            "args": [
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-http2",
                 "--disable-blink-features=AutomationControlled",
             ],
-        )
+        }
+        if PROXY_URL:
+            launch_kwargs["proxy"] = {"server": PROXY_URL}
+
+        browser = p.chromium.launch(**launch_kwargs)
         context = browser.new_context(
             ignore_https_errors=True,
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
@@ -689,7 +685,6 @@ def buscar_decisiones_en_portal_tsj(fecha_inicio, fecha_fin):
         )
         page = context.new_page()
 
-        # Bloquear imágenes, audios y fuentes para acelerar drásticamente la carga desde GitHub
         page.route(
             "**/*",
             lambda route: route.abort()
@@ -712,14 +707,13 @@ def buscar_decisiones_en_portal_tsj(fecha_inicio, fecha_fin):
             portal_accesible = True
 
             for anio in anios_necesarios:
-                # Seleccionar el año en el desplegable "Años" si es necesario
                 try:
                     select_anio = page.locator("select").first
                     if select_anio.count() > 0:
                         valor_actual = select_anio.input_value()
                         if str(anio) not in str(valor_actual):
                             select_anio.select_option(label=str(anio))
-                            page.wait_for_timeout(2500)
+                            page.wait_for_timeout(3000)
                 except Exception as e:
                     print(f"    ⚠ Aviso seleccionando año {anio}: {e}")
 
@@ -737,14 +731,12 @@ def buscar_decisiones_en_portal_tsj(fecha_inicio, fecha_fin):
                     resultados_por_fecha.setdefault(f_obj, [])
 
                     try:
-                        # Guardar enlaces previos para detectar los nuevos que cargue el clic
                         hrefs_antes = set(
                             page.evaluate(
                                 f"() => Array.from(document.querySelectorAll('a[href*=\"/decisiones/{codigo_sala}/\"]')).map(a => a.href)"
                             )
                         )
 
-                        # Hacer clic en el círculo verde del día dentro de la fila del mes correspondiente
                         clic_realizado = page.evaluate(
                             """([mesTarget, diaTarget]) => {
                                 const contenedores = Array.from(document.querySelectorAll('tr, div, li'));
@@ -772,10 +764,9 @@ def buscar_decisiones_en_portal_tsj(fecha_inicio, fecha_fin):
                             print(f"      ⚠ No se pudo hacer clic en {mes_txt} {dia_txt}")
                             continue
 
-                        # Esperar a que aparezcan los enlaces de las decisiones de ese día
                         enlaces_dia = {}
-                        for _ in range(12):
-                            page.wait_for_timeout(1000)
+                        for _ in range(15):
+                            page.wait_for_timeout(1200)
                             items_dom = page.evaluate(
                                 f"""() => {{
                                     return Array.from(document.querySelectorAll('a[href*="/decisiones/{codigo_sala}/"]')).map(a => {{
@@ -952,7 +943,7 @@ def main():
     decisiones_por_dia, portal_accesible = buscar_decisiones_en_portal_tsj(fecha_inicio, fecha_fin)
 
     if not portal_accesible:
-        print("\n⚠️  El portal del TSJ no respondió desde el servidor. No se modificará la fecha de control para reintentar luego.")
+        print("\n⚠️  El portal del TSJ no respondió a través de la conexión actual. No se modificará la fecha de control.")
         export_csv(conn)
         conn.close()
         return
@@ -1062,7 +1053,7 @@ def main():
     print(f"{'=' * 65}")
     print(f"  ✅ Extractos de nulidad nuevos: {total_inserted}")
     print(f"  📝 Extractos enriquecidos:      {total_updated}")
-    print(f"  🔄 Duplicados omitidas:         {total_duplicated}")
+    print(f"  🔄 Duplicados omitidos:         {total_duplicated}")
     print(f"  📋 Total extractos en BD:       {total_ext} ({sent_unicas} sentencias únicas)")
     print(f"{'=' * 65}")
 
