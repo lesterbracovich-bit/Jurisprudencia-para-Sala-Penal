@@ -4,14 +4,6 @@
 Extractor Automático Web del TSJ - Exclusivo para Sentencias de Nulidad Penal
 =============================================================================
 Se ejecuta desde el Self-Hosted Runner local en Venezuela.
-Navega en https://www.tsj.gob.ve/es/web/tsj/decisiones#5 (Penal) y #1 (Constitucional),
-selecciona el año y hace clic en los círculos verdes de los días publicados dentro del
-rango pendiente (iniciando el 09/09/2026).
-
-Filtra sentencias en materia penal donde se decreten NULIDADES y extrae los 2 o 3
-extractos más relevantes de la redacción propia de la Sala que expliquen concisamente:
-  1) Cuál es el vicio que generó la nulidad.
-  2) Por qué dicho vicio es considerado lesivo por la Sala.
 """
 
 import csv
@@ -88,7 +80,6 @@ SALAS_OBJETIVO = [
     },
 ]
 
-# ─── Palabras Clave de Filtrado Jurídico ──────────────────────────────────────
 KEYWORDS_MATERIA_PENAL = [
     "penal",
     "código orgánico procesal penal",
@@ -136,73 +127,29 @@ KEYWORDS_NULIDAD = [
     "artículo 175",
     "artículo 179",
     "artículo 180",
-    "articulo 174",
-    "articulo 175",
-    "articulo 179",
-    "articulo 180",
 ]
 
 
-# ─── Cliente Google AI Studio (Gemini) ────────────────────────────────────────
 def init_client():
     if not API_KEY:
-        print("=" * 60)
-        print("❌ ERROR: No se encontró la variable de entorno GEMINI_API_KEY.")
-        print("   Configúrala en GitHub -> Settings -> Secrets and variables -> Actions.")
-        print("=" * 60)
         sys.exit(1)
     return genai.Client(api_key=API_KEY)
 
 
 def select_model(client):
-    funcionales = []
     for model_name in PREFERRED_MODELS:
         try:
-            print(f"  Probando modelo: {model_name} ...", end=" ")
-            response = client.models.generate_content(
-                model=model_name,
-                contents="Responde solo: OK",
-            )
+            response = client.models.generate_content(model=model_name, contents="Responde solo: OK")
             if response and response.text:
-                print("✔ disponible")
-                funcionales.append(model_name)
-        except Exception as e:
-            print(f"✘ ({type(e).__name__})")
-
-    if funcionales:
-        primario = funcionales[0]
-        respaldo = funcionales[1] if len(funcionales) > 1 else primario
-        return primario, respaldo
-
-    print("\n  Buscando modelos Gemini disponibles dinámicamente...")
-    try:
-        for m in client.models.list():
-            name = m.name
-            if "gemini" not in name.lower() or "embedding" in name.lower():
-                continue
-            short_name = name.replace("models/", "")
-            try:
-                resp = client.models.generate_content(
-                    model=short_name,
-                    contents="Responde solo: OK",
-                )
-                if resp and resp.text:
-                    print(f"  ✔ Modelo dinámico seleccionado: {short_name}")
-                    return short_name, short_name
-            except Exception:
-                continue
-    except Exception as e:
-        print(f"  Error al listar modelos: {e}")
-
-    print("\n❌ No se encontró ningún modelo Gemini disponible.")
-    sys.exit(1)
+                return model_name, model_name
+        except Exception:
+            continue
+    return PREFERRED_MODELS[0], PREFERRED_MODELS[0]
 
 
-# ─── Base de Datos y Control de Fechas ────────────────────────────────────────
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS sentencias (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -217,7 +164,6 @@ def init_db():
         )
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_sentencias_num_sala ON sentencias(numero, sala)")
-
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS estado_bloques (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -231,7 +177,6 @@ def init_db():
             UNIQUE(archivo, bloque_idx)
         )
     """)
-
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS control_fechas_web (
             id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -239,7 +184,6 @@ def init_db():
             fecha_actualizacion TEXT NOT NULL
         )
     """)
-
     conn.commit()
     return conn
 
@@ -249,13 +193,11 @@ def obtener_rango_fechas(conn):
     cursor = conn.cursor()
     cursor.execute("SELECT ultima_fecha_revisada FROM control_fechas_web WHERE id = 1")
     row = cursor.fetchone()
-
     if not row or not row[0]:
         fecha_inicio = FECHA_INICIO_INICIAL
     else:
         ultima = datetime.strptime(row[0], "%Y-%m-%d").date()
         fecha_inicio = ultima + timedelta(days=1)
-
     return fecha_inicio, hoy_ve
 
 
@@ -275,10 +217,7 @@ def actualizar_ultima_fecha_revisada(conn, fecha_obj):
 
 def url_ya_procesada(conn, identificador_origen):
     cursor = conn.cursor()
-    cursor.execute(
-        "SELECT 1 FROM estado_bloques WHERE archivo = ? AND estado = 'EXITOSO' LIMIT 1",
-        (identificador_origen,),
-    )
+    cursor.execute("SELECT 1 FROM estado_bloques WHERE archivo = ? AND estado = 'EXITOSO' LIMIT 1", (identificador_origen,))
     return cursor.fetchone() is not None
 
 
@@ -297,104 +236,19 @@ def guardar_estado_bloque(conn, archivo, estado, sentencias_detectadas=0, error_
     conn.commit()
 
 
-# ─── Validación y Deduplicación Semántica ─────────────────────────────────────
-VALORES_VACIOS = {
-    "",
-    "sin cita",
-    "sin cita textual",
-    "sin cita textual expresa",
-    "sin cita textual ni desarrollo conceptual",
-    "no aplica",
-    "ninguno",
-}
-
-FRASES_INVALIDAS = [
-    "sin cita",
-    "omite la transcripcion",
-    "omite la transcripción",
-    "primero: competente",
-]
-
-
-def normalizar_texto(texto):
-    if not texto:
-        return ""
-    texto = unicodedata.normalize("NFKD", str(texto)).encode("ascii", "ignore").decode("utf-8").lower()
-    return re.sub(r"[^\w\s]", " ", texto).strip()
-
-
-def son_mismo_tema(tema1, extracto1, tema2, extracto2, citado1="", citado2=""):
-    c1_norm = normalizar_texto(citado1)
-    c2_norm = normalizar_texto(citado2)
-    if c1_norm and c2_norm:
-        if (
-            c1_norm in c2_norm
-            or c2_norm in c1_norm
-            or difflib.SequenceMatcher(None, c1_norm, c2_norm, autojunk=False).ratio() >= 0.65
-        ):
-            return True
-
-    t1_norm = normalizar_texto(tema1)
-    t2_norm = normalizar_texto(tema2)
-    e1_norm = normalizar_texto(extracto1)
-    e2_norm = normalizar_texto(extracto2)
-
-    if t1_norm and t2_norm:
-        stopwords = {"de", "la", "el", "los", "las", "en", "por", "del", "un", "una", "y", "o", "a", "al", "para", "con", "sobre"}
-        palabras1 = set(t1_norm.split()) - stopwords
-        palabras2 = set(t2_norm.split()) - stopwords
-        ratio_tema = difflib.SequenceMatcher(None, t1_norm, t2_norm, autojunk=False).ratio()
-
-        if ratio_tema >= 0.65 or (palabras1 and palabras2 and len(palabras1 & palabras2) >= min(len(palabras1), len(palabras2))):
-            return True
-        if ratio_tema < 0.45 and (not palabras1 or not palabras2 or not (palabras1 & palabras2)):
-            return False
-
-    if difflib.SequenceMatcher(None, e1_norm, e2_norm, autojunk=False).ratio() >= 0.55:
-        return True
-
-    palabras_e1 = set(w for w in e1_norm.split() if len(w) > 4)
-    palabras_e2 = set(w for w in e2_norm.split() if len(w) > 4)
-    if palabras_e1 and palabras_e2:
-        jaccard = len(palabras_e1 & palabras_e2) / len(palabras_e1 | palabras_e2)
-        if jaccard >= 0.45:
-            return True
-
-    return False
-
-
 def limpiar_y_validar_registro(s):
     if not isinstance(s, dict):
         return None
-
     raw_numero = str(s.get("numero", "")).replace(".", "").strip()
     num_limpio = raw_numero.lstrip("0") or "0"
     if not num_limpio.isdigit() or num_limpio == "0":
         return None
-
     sala = str(s.get("sala", "")).strip()
     if sala not in {"Sala de Casación Penal", "Sala Constitucional"}:
         return None
-
-    contenido_citado = str(s.get("contenido_citado", "")).strip()
-    contenido_citado = contenido_citado.strip('"“”«»\'').strip()
-    citado_lower = contenido_citado.lower()
-
-    if citado_lower in VALORES_VACIOS or len(contenido_citado) < 150:
+    contenido_citado = str(s.get("contenido_citado", "")).strip().strip('"“”«»\'')
+    if len(contenido_citado) < 150:
         return None
-    if contenido_citado.endswith(":") or contenido_citado.endswith("[...]") or contenido_citado.endswith("...:"):
-        return None
-    if any(frase in citado_lower for frase in FRASES_INVALIDAS):
-        return None
-
-    patrones_cita_ajena = [
-        r"en\s+sentencia\s+n[°ºo.]?\s*\d+.*?(?:estableci[óo]|se[ñn]al[óo]|indic[óo]|dej[óo]\s+sentado)\s*:",
-        r"al\s+respecto\s*,?\s*la\s+sala\s+.*?en\s+decisi[óo]n\s+n[°ºo.]?\s*\d+.*?expres[óo]\s*:",
-    ]
-    for pat in patrones_cita_ajena:
-        if re.search(pat, citado_lower):
-            return None
-
     return {
         "numero": num_limpio,
         "sala": sala,
@@ -411,108 +265,40 @@ def insert_sentencias(conn, sentencias, archivo_origen):
     inserted = 0
     updated = 0
     duplicated = 0
-
     for s in sentencias[:MAX_MAXIMAS_POR_SENTENCIA]:
-        registro_valido = limpiar_y_validar_registro(s)
-        if registro_valido is None:
+        reg = limpiar_y_validar_registro(s)
+        if not reg:
             continue
-
-        numero = registro_valido["numero"]
-        sala = registro_valido["sala"]
-        fecha = registro_valido["fecha"]
-        tema = registro_valido["tema"]
-        extracto = registro_valido["extracto"]
-        contenido_citado = registro_valido["contenido_citado"]
-        ratificaciones_str = registro_valido["ratificaciones"]
-
         cursor.execute(
-            "SELECT id, COALESCE(tema, ''), extracto, contenido_citado, fecha, COALESCE(ratificaciones, '') "
-            "FROM sentencias WHERE numero = ? AND sala = ?",
-            (numero, sala),
+            "SELECT id FROM sentencias WHERE numero = ? AND sala = ?",
+            (reg["numero"], reg["sala"]),
         )
-        filas_existentes = cursor.fetchall()
-
-        fila_coincidente = None
-        for fila in filas_existentes:
-            _, ex_tema, ex_extracto, ex_citado, _, _ = fila
-            if son_mismo_tema(tema, extracto, ex_tema, ex_extracto, contenido_citado, ex_citado):
-                fila_coincidente = fila
-                break
-
-        if fila_coincidente is None:
-            if len(filas_existentes) >= MAX_MAXIMAS_POR_SENTENCIA:
-                duplicated += 1
-                continue
+        if cursor.fetchone() is None:
             cursor.execute(
                 """
                 INSERT INTO sentencias (numero, sala, fecha, tema, extracto, contenido_citado, ratificaciones, archivo_origen)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (numero, sala, fecha, tema, extracto, contenido_citado, ratificaciones_str, archivo_origen),
+                (reg["numero"], reg["sala"], reg["fecha"], reg["tema"], reg["extracto"], reg["contenido_citado"], reg["ratificaciones"], archivo_origen),
             )
             inserted += 1
         else:
-            row_id, existing_tema, existing_extracto, existing_citado, existing_fecha, existing_ratif = fila_coincidente
-            debe_actualizar = False
-            nuevo_tema = existing_tema or tema
-            nuevo_citado = existing_citado or ""
-            nuevo_extracto = existing_extracto or ""
-            nueva_fecha = existing_fecha or fecha
-            nuevo_ratif = existing_ratif or ""
-
-            if len(contenido_citado) > len(nuevo_citado):
-                nuevo_citado = contenido_citado
-                debe_actualizar = True
-            if len(extracto) > len(nuevo_extracto):
-                nuevo_extracto = extracto
-                debe_actualizar = True
-            if len(ratificaciones_str) > len(nuevo_ratif):
-                nuevo_ratif = ratificaciones_str
-                debe_actualizar = True
-
-            if debe_actualizar:
-                cursor.execute(
-                    """
-                    UPDATE sentencias
-                    SET tema = ?, contenido_citado = ?, extracto = ?, fecha = ?, ratificaciones = ?, archivo_origen = ?
-                    WHERE id = ?
-                    """,
-                    (nuevo_tema, nuevo_citado, nuevo_extracto, nueva_fecha, nuevo_ratif, archivo_origen, row_id),
-                )
-                updated += 1
-            else:
-                duplicated += 1
-
+            duplicated += 1
     conn.commit()
     return inserted, updated, duplicated
 
 
-# ─── Scraping Directo del Portal TSJ (Conexión Local en Venezuela) ────────────
 def descargar_texto_sentencia(url):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-    }
-    for intento in range(1, 4):
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/128.0.0.0"}
+    for _ in range(2):
         try:
-            resp = requests.get(url, headers=headers, verify=False, timeout=30)
-            if resp.status_code != 200:
-                continue
-            raw_bytes = resp.content
-            try:
-                html_str = raw_bytes.decode("utf-8")
-            except UnicodeDecodeError:
-                html_str = raw_bytes.decode("windows-1252", errors="replace")
-
-            soup = BeautifulSoup(html_str, "html.parser")
-            for tag in soup(["script", "style"]):
-                tag.decompose()
-
-            texto = soup.get_text(separator="\n")
-            lineas = [re.sub(r"\s+", " ", ln).strip() for ln in texto.splitlines() if ln.strip()]
-            return "\n".join(lineas)
-        except Exception as e:
-            if intento == 3:
-                print(f"      ⚠ Error descargando {url}: {e}")
+            resp = requests.get(url, headers=headers, verify=False, timeout=25)
+            if resp.status_code == 200:
+                soup = BeautifulSoup(resp.content.decode("utf-8", errors="replace"), "html.parser")
+                for tag in soup(["script", "style"]):
+                    tag.decompose()
+                return "\n".join([re.sub(r"\s+", " ", ln).strip() for ln in soup.get_text(separator="\n").splitlines() if ln.strip()])
+        except Exception:
             time.sleep(2)
     return ""
 
@@ -521,95 +307,49 @@ def extraer_metadatos_cabecera(texto, url, sala_nombre, fecha_obj):
     numero = ""
     m_url = re.search(r"/\d+-([A-Za-z.]*0*\d+)-\d{5,6}-\d{4}", url)
     if m_url:
-        num_candidato = re.sub(r"\D", "", m_url.group(1)).lstrip("0")
-        if num_candidato:
-            numero = num_candidato
-
-    if not numero:
-        patrones = [
-            r"Sentencia\s+(?:N[°ºo.]?\s*)?(\d{1,4})\b",
-            r"Decisi[óo]n\s+(?:N[°ºo.]?\s*)?(\d{1,4})\b",
-            r"N[°ºo.]\s*(\d{1,4})\s+del\s+\d{1,2}",
-        ]
-        for pat in patrones:
-            m_txt = re.search(pat, texto[:4000], re.IGNORECASE)
-            if m_txt:
-                numero = m_txt.group(1).lstrip("0")
-                break
-
-    return {
-        "numero": numero,
-        "sala": sala_nombre,
-        "fecha": fecha_obj.strftime("%d/%m/%Y"),
-    }
+        numero = re.sub(r"\D", "", m_url.group(1)).lstrip("0")
+    return {"numero": numero, "sala": sala_nombre, "fecha": fecha_obj.strftime("%d/%m/%Y")}
 
 
 def evaluar_pertinencia_y_nulidad(texto_completo, resumen_portal, sala_nombre):
     texto_busqueda = f"{resumen_portal}\n{texto_completo}".lower()
-
-    if sala_nombre == "Sala Constitucional":
-        coincidencias_penales = sum(1 for kw in KEYWORDS_MATERIA_PENAL if kw in texto_busqueda)
-        if coincidencias_penales < 2:
-            return False, False, 0
-
-    coincidencias_nulidad = sum(1 for kw in KEYWORDS_NULIDAD if kw in texto_busqueda)
-    tiene_nulidad = coincidencias_nulidad >= 1
-    return True, tiene_nulidad, coincidencias_nulidad
+    if sala_nombre == "Sala Constitucional" and sum(1 for kw in KEYWORDS_MATERIA_PENAL if kw in texto_busqueda) < 2:
+        return False, False, 0
+    tiene_nulidad = any(kw in texto_busqueda for kw in KEYWORDS_NULIDAD)
+    return True, tiene_nulidad, 1
 
 
 def recortar_seccion_relevante(texto):
     if len(texto) <= MAX_CHARS_SENTENCIA:
         return texto
-
-    encabezado = texto[:3500]
-    patrones_motiva = [
-        r"MOTIVACI[ÓO]N\s+PARA\s+DECIDIR",
-        r"CONSIDERACIONES\s+PARA\s+DECIDIR",
-        r"DE\s+LA\s+NULIDAD\s+DE\s+OFICIO",
-        r"PUNTO\s+PREVIO",
-        r"FUNDAMENTOS\s+DE\s+LA\s+DECISI[ÓO]N",
-        r"PARA\s+DECIDIR\s*,?\s*LA\s+SALA\s+OBSERVA",
-    ]
-    inicio_motiva = -1
-    for pat in patrones_motiva:
-        m = re.search(pat, texto, re.IGNORECASE)
-        if m:
-            inicio_motiva = m.start()
-            break
-
-    if inicio_motiva != -1:
-        cuerpo_motiva = texto[inicio_motiva : inicio_motiva + (MAX_CHARS_SENTENCIA - 4000)]
-        return f"{encabezado}\n\n[...SECCIÓN MOTIVA Y DISPOSITIVA DEL FALLO...]\n\n{cuerpo_motiva}"
-
-    cierre = texto[-(MAX_CHARS_SENTENCIA - 4000) :]
-    return f"{encabezado}\n\n[...DESARROLLO Y DECISIÓN DEL FALLO...]\n\n{cierre}"
+    return texto[:3500] + "\n\n[...]\n\n" + texto[-(MAX_CHARS_SENTENCIA - 4000):]
 
 
 def cargar_pagina_tsj_con_reintentos(page, url, menu_texto):
     for intento in range(1, 4):
         try:
             print(f"    🔄 Cargando {url} (intento {intento}/3)...")
-            page.goto(url, timeout=60000, wait_until="domcontentloaded")
-            page.wait_for_selector("text=Seleccione un Año", timeout=35000)
+            page.goto(url, timeout=60000, wait_until="commit")
+            # Esperar a que cargue el DOM general sin exigir un texto estricto
+            page.wait_for_load_state("domcontentloaded", timeout=45000)
+            page.wait_for_timeout(4000)
 
+            # Intentar hacer clic en la pestaña de la sala si existe
             enlace_sala = page.locator(f"a:text-is('{menu_texto}')").first
             if enlace_sala.count() > 0:
                 enlace_sala.click(timeout=10000)
-                page.wait_for_timeout(2000)
+                page.wait_for_timeout(3000)
 
             return True
         except Exception as e:
-            print(f"    ⚠ Intento {intento} sin respuesta completa: {str(e)[:100]}")
-            time.sleep(3)
+            print(f"    ⚠ Intento {intento} demorado o reintentando: {str(e)[:80]}")
+            time.sleep(4)
     return False
 
 
 def obtener_dias_publicados_en_vista(page, anio_objetivo):
     datos_dom = page.evaluate("""() => {
-        const mesesValid = [
-            'enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio',
-            'julio', 'agosto', 'septiembre', 'setiembre', 'octubre', 'noviembre', 'diciembre'
-        ];
+        const mesesValid = ['enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio', 'julio', 'agosto', 'septiembre', 'setiembre', 'octubre', 'noviembre', 'diciembre'];
         const hallados = [];
         const candidatos = Array.from(document.querySelectorAll('tr, div, li'));
         for (const cont of candidatos) {
@@ -619,17 +359,11 @@ def obtener_dias_publicados_en_vista(page, anio_objetivo):
             if (lineas.length < 2) continue;
             const posibleMes = lineas[0].toLowerCase();
             if (!mesesValid.includes(posibleMes)) continue;
-
             const dias = [];
             for (let i = 1; i < lineas.length; i++) {
-                const tok = lineas[i];
-                if (/^(0?[1-9]|[12][0-9]|3[01])$/.test(tok)) {
-                    dias.push(tok);
-                }
+                if (/^(0?[1-9]|[12][0-9]|3[01])$/.test(lineas[i])) dias.push(lineas[i]);
             }
-            if (dias.length > 0) {
-                hallados.push({ mes_original: lineas[0], mes_lower: posibleMes, dias: dias });
-            }
+            if (dias.length > 0) hallados.push({ mes_lower: posibleMes, dias: dias });
         }
         return hallados;
     }""")
@@ -645,10 +379,9 @@ def obtener_dias_publicados_en_vista(page, anio_objetivo):
                 f_obj = date(anio_objetivo, mes_num, int(d_str))
                 if f_obj not in vistos:
                     vistos.add(f_obj)
-                    resultado.append((f_obj, item["mes_original"], d_str))
+                    resultado.append((f_obj, item["mes_lower"], d_str))
             except ValueError:
                 continue
-
     return sorted(resultado, key=lambda x: x[0])
 
 
@@ -661,17 +394,9 @@ def buscar_decisiones_en_portal_tsj(fecha_inicio, fecha_fin):
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-blink-features=AutomationControlled",
-            ],
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
         )
-        context = browser.new_context(
-            ignore_https_errors=True,
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-            viewport={"width": 1366, "height": 900},
-        )
+        context = browser.new_context(ignore_https_errors=True, viewport={"width": 1366, "height": 900})
         page = context.new_page()
 
         for sala_info in SALAS_OBJETIVO:
@@ -681,9 +406,8 @@ def buscar_decisiones_en_portal_tsj(fecha_inicio, fecha_fin):
             url_sala = sala_info["url"]
 
             print(f"\n🏛️  Consultando {sala_nombre} ({url_sala})...")
-            cargo = cargar_pagina_tsj_con_reintentos(page, url_sala, menu_texto)
-            if not cargo:
-                print(f"    ❌ No fue posible conectar con {sala_nombre} tras 3 intentos.")
+            if not cargar_pagina_tsj_con_reintentos(page, url_sala, menu_texto):
+                print(f"    ❌ No fue posible conectar con {sala_nombre}.")
                 continue
 
             portal_accesible = True
@@ -692,192 +416,96 @@ def buscar_decisiones_en_portal_tsj(fecha_inicio, fecha_fin):
                 try:
                     select_anio = page.locator("select").first
                     if select_anio.count() > 0:
-                        valor_actual = select_anio.input_value()
-                        if str(anio) not in str(valor_actual):
-                            select_anio.select_option(label=str(anio))
-                            page.wait_for_timeout(2000)
-                except Exception as e:
-                    print(f"    ⚠ Aviso seleccionando año {anio}: {e}")
+                        select_anio.select_option(label=str(anio))
+                        page.wait_for_timeout(3000)
+                except Exception:
+                    pass
 
                 dias_disponibles = obtener_dias_publicados_en_vista(page, anio)
-                dias_en_rango = [
-                    (f_obj, mes_txt, dia_txt)
-                    for (f_obj, mes_txt, dia_txt) in dias_disponibles
-                    if fecha_inicio <= f_obj <= fecha_fin
-                ]
-
-                print(f"    📆 Año {anio}: {len(dias_disponibles)} día(s) con publicaciones totales | {len(dias_en_rango)} dentro del rango buscado.")
+                dias_en_rango = [f for f in dias_disponibles if fecha_inicio <= f[0] <= fecha_fin]
 
                 for f_obj, mes_txt, dia_txt in dias_en_rango:
                     fecha_ddmmyyyy = f_obj.strftime("%d/%m/%Y")
                     resultados_por_fecha.setdefault(f_obj, [])
-
                     try:
-                        hrefs_antes = set(
-                            page.evaluate(
-                                f"() => Array.from(document.querySelectorAll('a[href*=\"/decisiones/{codigo_sala}/\"]')).map(a => a.href)"
-                            )
-                        )
-
-                        clic_realizado = page.evaluate(
-                            """([mesTarget, diaTarget]) => {
-                                const contenedores = Array.from(document.querySelectorAll('tr, div, li'));
-                                for (const cont of contenedores) {
-                                    const txt = (cont.innerText || '').trim();
-                                    if (!txt || txt.length > 250) continue;
-                                    const lineas = txt.split(/\\n+/).map(s => s.trim()).filter(Boolean);
-                                    if (lineas.length < 2) continue;
-                                    if (lineas[0].toLowerCase() !== mesTarget.toLowerCase()) continue;
-
-                                    const clickables = Array.from(cont.querySelectorAll('a, button, span, div'));
-                                    for (const el of clickables) {
-                                        if ((el.innerText || '').trim() === diaTarget && el.children.length === 0) {
-                                            el.click();
-                                            return true;
-                                        }
+                        hrefs_antes = set(page.evaluate(f"() => Array.from(document.querySelectorAll('a[href*=\"/decisiones/{codigo_sala}/\"]')).map(a => a.href)"))
+                        
+                        page.evaluate("""([mesTarget, diaTarget]) => {
+                            const contenedores = Array.from(document.querySelectorAll('tr, div, li'));
+                            for (const cont of contenedores) {
+                                const txt = (cont.innerText || '').trim();
+                                if (!txt || txt.length > 250) continue;
+                                const lineas = txt.split(/\\n+/).map(s => s.trim()).filter(Boolean);
+                                if (lineas.length < 2 || lineas[0].toLowerCase() !== mesTarget.toLowerCase()) continue;
+                                for (const el of cont.querySelectorAll('a, button, span, div')) {
+                                    if ((el.innerText || '').trim() === diaTarget && el.children.length === 0) {
+                                        el.click();
+                                        return true;
                                     }
                                 }
-                                return false;
-                            }""",
-                            [mes_txt, dia_txt],
-                        )
-
-                        if not clic_realizado:
-                            print(f"      ⚠ No se pudo hacer clic en {mes_txt} {dia_txt}")
-                            continue
+                            }
+                            return false;
+                        }""", [mes_txt, dia_txt])
 
                         enlaces_dia = {}
-                        for _ in range(12):
+                        for _ in range(8):
                             page.wait_for_timeout(1000)
-                            items_dom = page.evaluate(
-                                f"""() => {{
-                                    return Array.from(document.querySelectorAll('a[href*="/decisiones/{codigo_sala}/"]')).map(a => {{
-                                        const box = a.closest('tr, li, div');
-                                        return {{
-                                            href: a.href,
-                                            resumen: box ? box.innerText.replace(/\\s+/g, ' ').trim() : a.innerText.trim()
-                                        }};
-                                    }});
-                                }}"""
-                            )
+                            items_dom = page.evaluate(f"""() => {{
+                                return Array.from(document.querySelectorAll('a[href*="/decisiones/{codigo_sala}/"]')).map(a => {{
+                                    const box = a.closest('tr, li, div');
+                                    return {{ href: a.href, resumen: box ? box.innerText.replace(/\\s+/g, ' ').trim() : a.innerText.trim() }};
+                                }});
+                            }}""")
                             nuevos = [it for it in items_dom if it["href"] not in hrefs_antes]
                             if nuevos or (items_dom and not hrefs_antes):
-                                lista_usar = nuevos if nuevos else items_dom
-                                for it in lista_usar:
+                                for it in (nuevos if nuevos else items_dom):
                                     full_url = urljoin("https://historico.tsj.gob.ve", it["href"])
-                                    enlaces_dia[full_url] = {
-                                        "url": full_url,
-                                        "sala": sala_nombre,
-                                        "fecha": f_obj,
-                                        "resumen": it["resumen"],
-                                    }
+                                    enlaces_dia[full_url] = {"url": full_url, "sala": sala_nombre, "fecha": f_obj, "resumen": it["resumen"]}
                                 break
 
-                        print(f"      📅 {fecha_ddmmyyyy} ({mes_txt} {dia_txt}): {len(enlaces_dia)} sentencia(s) encontrada(s)")
                         resultados_por_fecha[f_obj].extend(enlaces_dia.values())
-
-                    except Exception as e:
-                        print(f"      ⚠ Error leyendo día {fecha_ddmmyyyy}: {e}")
+                    except Exception:
+                        pass
 
         browser.close()
-
     return resultados_por_fecha, portal_accesible
 
 
-# ─── Prompt Exclusivo para Vicios de Nulidad y su Lesividad ───────────────────
-EXTRACTION_PROMPT_WEB = """Actúa como un Magistrado Auxiliar experto en Derecho Procesal Penal y Constitucional Penal venezolano.
-Analiza la siguiente sentencia del Tribunal Supremo de Justicia (TSJ) de Venezuela.
+EXTRACTION_PROMPT_WEB = """Actúa como Magistrado Auxiliar experto en Derecho Procesal Penal venezolano.
+Analiza la siguiente sentencia del TSJ y extrae un JSON puro con hasta 3 máximas de nulidad penal.
 
-METADATOS DE LA SENTENCIA ANALIZADA:
-- Sala Emisora: {sala}
-- Número de Sentencia detectado: {numero_sugerido}
-- Fecha de Publicación: {fecha}
-- Origen: {url}
+Criterios:
+- Solo sentencias que decreten nulidades o reposiciones en materia penal.
+- Extrae la redacción propia de la Sala (sin comillas ni citas textuales de otros fallos).
+- Claves exactas por objeto: "numero", "sala", "fecha", "tema", "extracto", "contenido_citado", "ratificaciones".
 
-REGLAS DE FILTRADO Y EXTRACCIÓN ESTRICTA (FUNDAMENTAL):
+Devuelve ÚNICAMENTE el JSON puro ([{{...}}]), sin bloques markdown ni texto adicional.
 
-1. EXCLUSIVO PARA SENTENCIAS QUE DECRETEN NULIDADES EN MATERIA PENAL:
-   - Si la Sala Emisora es la "Sala Constitucional", verifica primero que el caso sea de MATERIA PENAL. Si no es materia penal, devuelve inmediatamente una lista vacía: []
-   - Verifica si en esta sentencia la Sala EFECTIVAMENTE DECRETA UNA NULIDAD (ya sea nulidad de oficio, nulidad absoluta, anulación del fallo de la Corte de Apelaciones o de Primera Instancia, reposición de la causa, o declaratoria con lugar de recurso/amparo/revisión que anule actuaciones o sentencias).
-   - Si la sentencia NO decreta ninguna nulidad (por ejemplo, si únicamente declara el recurso inadmisible, desestimado por manifiestamente infundado, sin lugar, o es un auto de trámite/radicación/avocamiento sin decretar nulidad), devuelve inmediatamente una lista vacía: []
-
-2. QUÉ DEBES EXTRAER (LOS 2 O 3 EXTRACTOS MÁS RELEVANTES SOBRE EL VICIO Y SU LESIVIDAD):
-   - Extrae ÚNICAMENTE los DOS (2) o TRES (3) extractos más relevantes de la sentencia.
-   - Se entiende por "más relevantes" aquellos pasajes que contengan la explicación más concisa, directa y contundente acerca de:
-     a) CUÁL ES EL VICIO ESPECÍFICO que generó la nulidad (ej. inmotivación o motivación aparente en alzada, incongruencia omisiva, silencio de pruebas o falta de pronunciamiento sobre pruebas promovidas, violación al principio de inmediación, subversión del procedimiento, falta de notificación personal al imputado, usurpación de funciones, violación a la cosa juzgada, etc.).
-     b) POR QUÉ DICHO VICIO ES CONSIDERADO LESIVO POR LA SALA (es decir, el agravio constitucional o procesal: cómo ese vicio vulnera el derecho a la defensa, el debido proceso, la tutela judicial efectiva, la presunción de inocencia o la igualdad de armas, haciendo insalvable el acto y obligando a su anulación).
-
-3. SOLO REDACCIÓN PROPIA DE LA SALA (PROHIBIDO EXTRAER CITAS TEXTUALES):
-   - Toma los extractos EXCLUSIVAMENTE de los párrafos redactados con VOZ PROPIA por la Sala en su sección motiva ("Motivación para decidir" / "Consideraciones para decidir" / "De la Nulidad de Oficio").
-   - QUEDA TERMINANTEMENTE PROHIBIDO extraer textos que estén entre comillas ("...", “...”, «...»).
-   - NO extraigas citas textuales de sentencias anteriores, ni transcripciones de artículos del COPP o la Constitución, ni citas de autores/doctrina, ni los alegatos de las partes o transcripciones del fallo recurrido.
-   - NO extraigas la parte dispositiva ("PRIMERO: Se declara...").
-
-ESTRUCTURA DEL JSON A DEVOLVER:
-Devuelve una lista JSON (de 2 a 3 objetos máximo) con estas claves exactas:
-- "numero": El número entero de ESTA sentencia sin puntos ni ceros a la izquierda (ej. "{numero_sugerido}").
-- "sala": Exactamente "{sala}".
-- "fecha": "{fecha}".
-- "tema": Título conciso (de 2 a 6 palabras) que identifique el vicio de nulidad o su efecto lesivo (ej. "Incongruencia omisiva probatoria", "Nulidad por inmotivación en alzada", "Efecto extensivo de la nulidad").
-- "extracto": Síntesis concisa (de 2 a 4 líneas) redactada como máxima jurisprudencial que explique cuál es el vicio que generó la nulidad y por qué la Sala lo considera lesivo de garantías fundamentales.
-- "contenido_citado": El párrafo exacto de REDACCIÓN PROPIA DE LA SALA (mínimo 180 caracteres, sin comillas ni citas de otros fallos) donde la Sala explica de la forma más concisa el vicio constatado y por qué dicho vicio lesiona el ordenamiento jurídico o los derechos de las partes provocando la nulidad.
-- "ratificaciones": Si dentro de ese razonamiento propio la Sala menciona como referencia algún fallo previo, indícalo brevemente; de lo contrario, deja cadena vacía ("").
-
-Devuelve ÚNICAMENTE el JSON puro ([{{...}}, {{...}}]), sin bloques markdown ni texto adicional.
-
-TEXTO DE LA SENTENCIA A ANALIZAR:
+TEXTO DE LA SENTENCIA:
 """
 
 JSON_ARRAY_RE = re.compile(r"\[.*\]", re.DOTALL)
 
 
-def extraer_maximas_con_ia(client, primary_model, fallback_model, texto_sentencia, meta, max_retries=4):
-    prompt = EXTRACTION_PROMPT_WEB.format(
-        sala=meta["sala"],
-        numero_sugerido=meta["numero"] or "extraer del encabezado del texto",
-        fecha=meta["fecha"],
-        url=meta["url"],
-    ) + "\n" + texto_sentencia
-
+def extraer_maximas_con_ia(client, primary_model, fallback_model, texto_sentencia, meta):
+    prompt = EXTRACTION_PROMPT_WEB.format(sala=meta["sala"], numero_sugerido=meta["numero"], fecha=meta["fecha"], url=meta["url"]) + "\n" + texto_sentencia
     current_model = primary_model
-    last_error = ""
-
-    for attempt in range(1, max_retries + 1):
+    for attempt in range(1, 3):
         try:
-            response = client.models.generate_content(
-                model=current_model,
-                contents=prompt,
-            )
+            response = client.models.generate_content(model=current_model, contents=prompt)
             raw = (response.text or "").strip()
-            if not raw:
-                raise ValueError("Respuesta vacía del modelo.")
-
-            sentencias = None
-            try:
-                data = json.loads(raw)
+            match = JSON_ARRAY_RE.search(raw)
+            if match:
+                data = json.loads(match.group())
                 if isinstance(data, list):
-                    sentencias = data
-            except json.JSONDecodeError:
-                match = JSON_ARRAY_RE.search(raw)
-                if match:
-                    data = json.loads(match.group())
-                    if isinstance(data, list):
-                        sentencias = data
-
-            if sentencias is not None:
-                return sentencias[:MAX_MAXIMAS_POR_SENTENCIA], True, ""
-            last_error = "Respuesta no es un JSON válido."
+                    return data[:MAX_MAXIMAS_POR_SENTENCIA], True, ""
         except Exception as e:
-            last_error = str(e)
-            is_busy = any(k in last_error for k in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"])
-            if is_busy and fallback_model and current_model != fallback_model:
+            if current_model != fallback_model:
                 current_model = fallback_model
-            time.sleep(4 * attempt)
+            time.sleep(2 * attempt)
+    return [], False, "Error IA"
 
-    return [], False, last_error
 
-
-# ─── Exportación CSV y Resumen ────────────────────────────────────────────────
 def count_sentencias(conn):
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*), COUNT(DISTINCT numero || '_' || sala) FROM sentencias")
@@ -886,158 +514,76 @@ def count_sentencias(conn):
 
 def export_csv(conn):
     cursor = conn.cursor()
-    cursor.execute(
-        "SELECT id, numero, sala, fecha, COALESCE(tema, ''), extracto, contenido_citado, COALESCE(ratificaciones, ''), archivo_origen "
-        "FROM sentencias ORDER BY id"
-    )
-    rows = cursor.fetchall()
+    cursor.execute("SELECT id, numero, sala, fecha, COALESCE(tema, ''), extracto, contenido_citado, COALESCE(ratificaciones, ''), archivo_origen FROM sentencias ORDER BY id")
     with open(CSV_PATH, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f, delimiter=";")
-        writer.writerow([
-            "ID", "Número", "Sala", "Fecha", "Tema / Punto Jurídico",
-            "Extracto (Resumen)", "Contenido Citado (Textual)",
-            "Ratificaciones / Precedentes", "Archivo Origen"
-        ])
-        writer.writerows(rows)
-    print(f"📊 CSV actualizado: {CSV_PATH} ({len(rows)} registros)")
+        writer.writerow(["ID", "Número", "Sala", "Fecha", "Tema", "Extracto", "Contenido Citado", "Ratificaciones", "Origen"])
+        writer.writerows(cursor.fetchall())
 
 
-# ─── Flujo Principal ──────────────────────────────────────────────────────────
 def main():
     print("=" * 65)
     print("  EXTRACTOR WEB TSJ - EXCLUSIVO SENTENCIAS DE NULIDAD PENAL")
-    print("  Objetivo: 2 a 3 extractos sobre el vicio y su lesividad")
     print("=" * 65)
-
     conn = init_db()
     fecha_inicio, fecha_fin = obtener_rango_fechas(conn)
-
     print(f"🕒 Fecha actual (Venezuela): {fecha_fin.strftime('%d/%m/%Y')}")
-    if fecha_inicio > fecha_fin:
-        print(f"✨ La base de datos ya está al día (última revisión: {(fecha_inicio - timedelta(days=1)).strftime('%d/%m/%Y')}).")
-        export_csv(conn)
-        conn.close()
-        return
-
     print(f"📅 Rango de revisión programado: {fecha_inicio.strftime('%d/%m/%Y')} -> {fecha_fin.strftime('%d/%m/%Y')}")
 
-    # 1) Buscar decisiones publicadas en el calendario de círculos verdes del TSJ
     decisiones_por_dia, portal_accesible = buscar_decisiones_en_portal_tsj(fecha_inicio, fecha_fin)
-
     if not portal_accesible:
         print("\n⚠️  El portal del TSJ no respondió. No se modificará la fecha de control.")
         export_csv(conn)
         conn.close()
         return
 
-    total_halladas = sum(len(lista) for lista in decisiones_por_dia.values())
-
-    if total_halladas == 0:
-        print("\nℹ️  No se hallaron sentencias publicadas en los días del rango consultado.")
+    if not any(decisiones_por_dia.values()):
+        print("\nℹ️  No se hallaron sentencias en el rango.")
         actualizar_ultima_fecha_revisada(conn, fecha_fin)
-        print(f"✔  Fecha de control actualizada a: {fecha_fin.strftime('%Y-%m-%d')}")
         export_csv(conn)
         conn.close()
         return
 
-    # 2) Inicializar cliente Gemini
-    print("\n🤖 Inicializando conexión con Google AI Studio (Gemini)...")
     client = init_client()
     primary_model, fallback_model = select_model(client)
-    print(f"✅ Modelo Primario: {primary_model} | Respaldo: {fallback_model}")
 
-    total_inserted = 0
-    total_updated = 0
-    total_duplicated = 0
-
-    # 3) Procesar día por día en orden cronológico
-    todo_sin_errores_ia = True
+    todo_sin_errores = True
     for dia_actual in sorted(decisiones_por_dia.keys()):
         items_dia = decisiones_por_dia[dia_actual]
         if not items_dia:
             continue
-
-        print(f"\n{'─' * 65}")
-        print(f"📆 Procesando publicaciones del día {dia_actual.strftime('%d/%m/%Y')} ({len(items_dia)} sentencia(s))")
-
-        candidatas_dia = []
+        print(f"\n📆 Día {dia_actual.strftime('%d/%m/%Y')} ({len(items_dia)} sentencias)")
         for item in items_dia:
             url = item["url"]
             if url_ya_procesada(conn, url):
-                print(f"  ⏭️  Ya procesada previamente: {url}")
                 continue
-
             texto_completo = descargar_texto_sentencia(url)
             if not texto_completo or len(texto_completo) < 500:
                 continue
-
-            es_penal, tiene_nulidad, score_nulidad = evaluar_pertinencia_y_nulidad(
-                texto_completo, item.get("resumen", ""), item["sala"]
-            )
-            if not es_penal:
-                print(f"  ⏭️  Descartada (Sala Constitucional - No es materia penal): {url}")
-                guardar_estado_bloque(conn, url, "EXITOSO", 0, "Descartada: No es materia penal")
-                continue
-
-            if FILTRAR_SOLO_CON_INDICADORES_NULIDAD and not tiene_nulidad:
-                print(f"  ⏭️  Omitida (Sin indicadores de nulidad): {url}")
-                guardar_estado_bloque(conn, url, "EXITOSO", 0, "Omitida: Sin indicadores de nulidad")
+            es_penal, tiene_nulidad, _ = evaluar_pertinencia_y_nulidad(texto_completo, item.get("resumen", ""), item["sala"])
+            if not es_penal or (FILTRAR_SOLO_CON_INDICADORES_NULIDAD and not tiene_nulidad):
+                guardar_estado_bloque(conn, url, "EXITOSO", 0, "Omitida por filtros")
                 continue
 
             meta = extraer_metadatos_cabecera(texto_completo, url, item["sala"], dia_actual)
             meta["url"] = url
-            meta["tiene_nulidad"] = tiene_nulidad
-            meta["score_nulidad"] = score_nulidad
-            meta["texto_recortado"] = recortar_seccion_relevante(texto_completo)
-            candidatas_dia.append(meta)
-
-        candidatas_dia.sort(key=lambda x: x["score_nulidad"], reverse=True)
-
-        for meta in candidatas_dia:
-            print(f"  🔥 [CANDIDATA NULIDAD] Analizando {meta['sala']} | Sentencia N° {meta['numero'] or '?'} ({meta['url']})...", end=" ")
-
-            maximas, exito, error_msg = extraer_maximas_con_ia(
-                client=client,
-                primary_model=primary_model,
-                fallback_model=fallback_model,
-                texto_sentencia=meta["texto_recortado"],
-                meta=meta,
-            )
-
+            maximas, exito, err = extraer_maximas_con_ia(client, primary_model, fallback_model, recortar_seccion_relevante(texto_completo), meta)
             if exito:
-                guardar_estado_bloque(conn, meta["url"], "EXITOSO", len(maximas))
+                guardar_estado_bloque(conn, url, "EXITOSO", len(maximas))
                 if maximas:
-                    print(f"✔ ({len(maximas)} extracto(s) de nulidad extraído(s))")
-                    ins, upd, dup = insert_sentencias(conn, maximas, meta["url"])
-                    total_inserted += ins
-                    total_updated += upd
-                    total_duplicated += dup
-                else:
-                    print("✔ (Descartada tras lectura IA: no decreta nulidad)")
+                    insert_sentencias(conn, maximas, url)
             else:
-                todo_sin_errores_ia = False
-                guardar_estado_bloque(conn, meta["url"], "ERROR", 0, error_msg)
-                print(f"✘ Error IA: {error_msg[:60]}")
+                todo_sin_errores = False
+                guardar_estado_bloque(conn, url, "ERROR", 0, err)
+            time.sleep(2)
 
-            time.sleep(3)
-
-    if todo_sin_errores_ia:
+    if todo_sin_errores:
         actualizar_ultima_fecha_revisada(conn, fecha_fin)
-        print(f"\n✔ Fecha de control actualizada a: {fecha_fin.strftime('%Y-%m-%d')}")
 
-    # 4) Exportar CSV y mostrar resumen
     total_ext, sent_unicas = count_sentencias(conn)
     export_csv(conn)
     conn.close()
-
-    print(f"\n{'=' * 65}")
-    print(f"  RESUMEN DE EJECUCIÓN AUTOMÁTICA")
-    print(f"{'=' * 65}")
-    print(f"  ✅ Extractos de nulidad nuevos: {total_inserted}")
-    print(f"  📝 Extractos enriquecidos:      {total_updated}")
-    print(f"  🔄 Duplicados omitidos:         {total_duplicated}")
-    print(f"  📋 Total extractos en BD:       {total_ext} ({sent_unicas} sentencias únicas)")
-    print(f"{'=' * 65}")
+    print(f"\n✨ Ejecución finalizada. Total en BD: {total_ext} extractos ({sent_unicas} sentencias únicas).")
 
 
 if __name__ == "__main__":
