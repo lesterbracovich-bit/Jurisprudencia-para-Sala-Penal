@@ -333,28 +333,50 @@ def main():
         hay_filtro = True
         cant_hallazgos = len(df_filtrado)
 
-    # ─── Aplicación del Límite de Visualización ──────────────────────────────
+    # ─── Control de Paginación y Estado ──────────────────────────────────────
+    if "pagina_actual" not in st.session_state:
+        st.session_state["pagina_actual"] = 1
+
+    # Resetear a página 1 si cambian los filtros o búsqueda
+    firma_filtro = (sala_seleccionada, busqueda_lateral.strip(), busqueda_principal.strip(), str(limite_opcion))
+    if st.session_state.get("ultima_firma_filtro") != firma_filtro:
+        st.session_state["pagina_actual"] = 1
+        st.session_state["ultima_firma_filtro"] = firma_filtro
+
+    total_registros = len(df_filtrado)
     if limite_opcion == "Todos":
-        df_mostrar = df_filtrado
+        tamano_pagina = max(1, total_registros)
+        total_paginas = 1
     else:
-        df_mostrar = df_filtrado.head(int(limite_opcion))
+        tamano_pagina = int(limite_opcion)
+        total_paginas = max(1, (total_registros + tamano_pagina - 1) // tamano_pagina)
+
+    # Asegurar que la página esté en rango
+    if st.session_state["pagina_actual"] > total_paginas:
+        st.session_state["pagina_actual"] = total_paginas
+    if st.session_state["pagina_actual"] < 1:
+        st.session_state["pagina_actual"] = 1
+
+    pagina_actual = st.session_state["pagina_actual"]
+
+    # Segmentar los registros correspondientes a la página activa
+    inicio = (pagina_actual - 1) * tamano_pagina
+    fin = min(inicio + tamano_pagina, total_registros)
+    df_mostrar = df_filtrado.iloc[inicio:fin] if total_registros > 0 else df_filtrado
 
     # ─── Barra informativa de resultados (Cabecera principal) ─────────────────
     col_info, col_export = st.columns([3, 1])
     with col_info:
         if not hay_filtro:
             st.info(
-                f"📌 **Mostrando los {len(df_mostrar)} criterios más recientes** *(de {len(df)} totales)* para una carga ultrarrápida. "
-                f"Usa el buscador para consultar cualquier criterio o tema del histórico completo."
+                f"📌 **Mostrando criterios del {inicio + 1} al {fin}** *(de {total_registros} totales)*. "
+                f"Página **{pagina_actual}** de **{total_paginas}**. Usa los botones de abajo o el buscador para explorar más."
             )
         else:
-            if len(df_mostrar) < cant_hallazgos:
-                st.markdown(
-                    f"🎯 **{cant_hallazgos}** resultado(s) encontrados. "
-                    f"Mostrando los primeros **{len(df_mostrar)}** *(puedes ampliar la cantidad en la barra lateral)*."
-                )
-            else:
-                st.markdown(f"🎯 **{cant_hallazgos}** resultado(s) encontrados para tu búsqueda.")
+            st.markdown(
+                f"🎯 **{total_registros}** resultado(s) encontrados. "
+                f"Mostrando del **{inicio + 1} al {fin}** (Página **{pagina_actual}** de **{total_paginas}**)."
+            )
     with col_export:
         csv_data = df_filtrado.to_csv(index=False, sep=";", encoding="utf-8-sig")
         st.download_button(
@@ -364,6 +386,29 @@ def main():
             mime="text/csv",
         )
 
+    def render_paginacion(posicion="top"):
+        """Renderiza los controles de cambio de página si hay más de 1 página."""
+        if total_paginas <= 1:
+            return
+        c_prev, c_info_pag, c_next = st.columns([1, 2, 1])
+        with c_prev:
+            if st.button("⬅️ Anterior", key=f"btn_prev_{posicion}", disabled=(pagina_actual <= 1), use_container_width=True):
+                st.session_state["pagina_actual"] -= 1
+                st.rerun()
+        with c_info_pag:
+            st.markdown(
+                f"<div style='text-align: center; padding-top: 6px; font-weight: 600; font-size: 0.98rem; color: var(--text-color);'>"
+                f"Página {pagina_actual} de {total_paginas} &nbsp;•&nbsp; ({inicio + 1} - {fin} de {total_registros})"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        with c_next:
+            if st.button("Siguiente ➡️", key=f"btn_next_{posicion}", disabled=(pagina_actual >= total_paginas), use_container_width=True):
+                st.session_state["pagina_actual"] += 1
+                st.rerun()
+
+    # Controles de paginación superiores
+    render_paginacion("top")
     st.write("")
 
     # ─── Renderizado de Tarjetas de Sentencias ────────────────────────────────
@@ -445,6 +490,10 @@ def main():
             if contenido_citado.strip() and contenido_citado.strip() != "Sin cita textual expresa":
                 st.markdown("**📜 Texto Literal Citado en el Documento:**")
                 st.markdown(f'<div class="cita-box">"{contenido_citado}"</div>', unsafe_allow_html=True)
+
+    # Controles de paginación inferiores (al final de los 20 criterios)
+    st.write("")
+    render_paginacion("bottom")
 
 
 if __name__ == "__main__":
