@@ -1,156 +1,734 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Extractor Automático Web del TSJ - Exclusivo para Sentencias de Nulidad Penal
-=============================================================================
-Se ejecuta desde el Self-Hosted Runner local en Venezuela.
+Extractor Web de Jurisprudencia – Sala de Casación Penal del TSJ
+=================================================================
+Descarga sentencias publicadas en el sitio web del Tribunal Supremo de Justicia
+(https://www.tsj.gob.ve/es/web/tsj/decisiones#5) y extrae MÁXIMAS JURÍDICAS
+(extractos relevantes de redacción original de la Sala) mediante Google Gemini.
+
+Características:
+  - Extracción directa vía API JSON del portal TSJ (Liferay) y descarga HTML
+    desde historico.tsj.gob.ve.
+  - Extracción exclusiva de MÁXIMAS doctrinales y ratio decidendi redactadas
+    originariamente por la Sala en cada sentencia (omite citas textuales ajenas).
+  - Seguimiento incremental automático: recuerda la última fecha procesada y
+    en ejecuciones posteriores solo revisa fechas nuevas a partir de ella.
+  - Por defecto (primera ejecución): procesa todas las sentencias de OCTUBRE 2026.
+  - Tabla de seguimiento de bloques (estado_bloques) para pausar y reanudar.
+  - Compatible con la base de datos común 'jurisprudencia_ia.db' y el visor_web.py.
+
+Uso:
+    python extractor_web.py                    # Modo automático (Octubre la 1ª vez; luego fechas nuevas)
+    python extractor_web.py --mes 10           # Procesa un mes específico (ej: 10 u octubre)
+    python extractor_web.py --fecha 23/10/2026 # Procesa un solo día específico
+    python extractor_web.py --desde 01/10/2026 # Procesa desde una fecha en adelante
+    python extractor_web.py --todas            # Procesa todas las fechas publicadas del año
+    python extractor_web.py --reset-fecha      # Reinicia el registro de última fecha a cero
+    python extractor_web.py --reprocesar-todo  # Reprocesa bloques previamente completados
 """
 
-import csv
-import difflib
-import functools
 import json
 import os
 import re
+import csv
 import sqlite3
 import sys
 import time
+import functools
+import difflib
 import unicodedata
-from datetime import date, datetime, timedelta
-from urllib.parse import urljoin
-from zoneinfo import ZoneInfo
+from datetime import datetime, date
+from urllib.parse import quote
 
-import requests
-import urllib3
-from bs4 import BeautifulSoup
-from google import genai
-from playwright.sync_api import sync_playwright
-
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# Forzar flush en todos los print para ver progreso en tiempo real en consola
 print = functools.partial(print, flush=True)
 
-# ─── Configuración General ────────────────────────────────────────────────────
+try:
+    import requests
+    from bs4 import BeautifulSoup
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+except ImportError:
+    print("=" * 60)
+    print("⚠  Faltan dependencias. Instálalas con:")
+    print("   pip install requests beautifulsoup4 urllib3")
+    print("=" * 60)
+    sys.exit(1)
+
+from google import genai
+
+# ─── Configuración General ───────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "jurisprudencia_ia.db")
 CSV_PATH = os.path.join(BASE_DIR, "reporte_jurisprudencia.csv")
 
-TZ_VENEZUELA = ZoneInfo("America/Caracas")
-FECHA_INICIO_INICIAL = date(2026, 9, 9)
-
-MAX_MAXIMAS_POR_SENTENCIA = 3
-FILTRAR_SOLO_CON_INDICADORES_NULIDAD = True
-MAX_CHARS_SENTENCIA = 45_000
-
 API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 
+# Modelos Gemini en orden de preferencia (disponibles en AI Studio)
 PREFERRED_MODELS = [
-    "gemini-3.5-flash-lite",
-    "gemini-3.6-flash",
-    "gemini-4-hydrogen",
+    "gemini-4-hydrogen",     # Eficiente, rápido y verificado disponible
+    "gemini-3.6-flash",      # Respaldo confiable
+    "gemini-3.5-flash-lite", # Respaldo liviano
+    "gemini-3.8-flash",      # Disponible en AI Studio
+    "gemini-4-argon",
+    "gemini-4-neon",
 ]
 
-MESES_NOMBRE_A_NUM = {
-    "enero": 1,
-    "febrero": 2,
-    "marzo": 3,
-    "abril": 4,
-    "mayo": 5,
-    "junio": 6,
-    "julio": 7,
-    "agosto": 8,
-    "septiembre": 9,
-    "setiembre": 9,
-    "octubre": 10,
-    "noviembre": 11,
-    "diciembre": 12,
+CHUNK_SIZE = 25_000
+CHUNK_OVERLAP = 3_000
+
+# ─── Configuración de Sala TSJ ────────────────────────────────────────────────
+SALA_ID = "003"           # Sala de Casación Penal en Liferay
+SALA_DIR = "scp"          # Subdirectorio en historico.tsj.gob.ve
+SALA_NOMBRE = "Sala de Casación Penal"
+ANO_DEFAULT = "2026"
+
+# ─── Endpoints API TSJ (Liferay) ─────────────────────────────────────────────
+TSJ_BASE = "https://www.tsj.gob.ve/es/decisiones"
+TSJ_HISTORICO_BASE = "https://historico.tsj.gob.ve/decisiones"
+
+# Endpoint para listar días con sentencias publicadas de un año y sala
+API_LIST_DAYS = (
+    "{base}?p_p_id=displaySentencias_WAR_NoticiasTsjPorlet612"
+    "&p_p_lifecycle=2&p_p_state=normal&p_p_mode=view"
+    "&p_p_cacheability=cacheLevelPage"
+    "&server%5Bendpoint%5D=%2Fservices%2FWSDecision.HTTPEndpoint"
+    "&server%5Bmethod%5D=%2FlistDayByAnoSala"
+    "&SALA={sala_id}&ANO={ano}"
+)
+
+# Endpoint para listar las sentencias de una fecha específica
+API_LIST_DECISIONS = (
+    "{base}?p_p_id=displayListaDecision_WAR_NoticiasTsjPorlet612"
+    "&p_p_lifecycle=2&p_p_state=normal&p_p_mode=view"
+    "&p_p_cacheability=cacheLevelPage"
+    "&server%5Bendpoint%5D=%2Fservices%2FWSDecision.HTTPEndpoint"
+    "&server%5Bmethod%5D=%2FlistDecisionByFechaSala"
+    "&FECHA={fecha_encoded}&SALA={sala_id}"
+)
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Accept-Language": "es-VE,es;q=0.9",
+    "X-Requested-With": "XMLHttpRequest",
+    "Referer": "https://www.tsj.gob.ve/es/web/tsj/decisiones",
 }
 
-SALAS_OBJETIVO = [
-    {
-        "nombre_bd": "Sala de Casación Penal",
-        "menu_texto": "Penal",
-        "codigo": "scp",
-        "url": "https://www.tsj.gob.ve/es/web/tsj/decisiones#5",
-    },
-    {
-        "nombre_bd": "Sala Constitucional",
-        "menu_texto": "Constitucional",
-        "codigo": "scon",
-        "url": "https://www.tsj.gob.ve/es/web/tsj/decisiones#1",
-    },
-]
-
-KEYWORDS_MATERIA_PENAL = [
-    "penal",
-    "código orgánico procesal penal",
-    "codigo organico procesal penal",
-    "copp",
-    "ministerio público",
-    "ministerio publico",
-    "fiscalía",
-    "fiscalia",
-    "imputad",
-    "acusad",
-    "delito",
-    "privación judicial preventiva de libertad",
-    "privacion judicial preventiva de libertad",
-    "audiencia preliminar",
-    "juicio oral",
-    "tribunal de control",
-    "tribunal de juicio",
-    "tribunal de ejecución",
-    "corte de apelaciones",
-    "hábeas corpus",
-    "habeas corpus",
-    "sobreseimiento",
-    "casación penal",
-]
-
-KEYWORDS_NULIDAD = [
-    "nulidad",
-    "nulo",
-    "nula",
-    "anula",
-    "anulación",
-    "anulacion",
-    "nulidad de oficio",
-    "nulidad absoluta",
-    "repone la causa",
-    "reponer la causa",
-    "reposición de la causa",
-    "reposicion de la causa",
-    "declara con lugar",
-    "inmotivación",
-    "inmotivacion",
-    "incongruencia omisiva",
-    "artículo 174",
-    "artículo 175",
-    "artículo 179",
-    "artículo 180",
-]
+MESES_MAP = {
+    "1": 1, "01": 1, "enero": 1,
+    "2": 2, "02": 2, "febrero": 2,
+    "3": 3, "03": 3, "marzo": 3,
+    "4": 4, "04": 4, "abril": 4,
+    "5": 5, "05": 5, "mayo": 5,
+    "6": 6, "06": 6, "junio": 6,
+    "7": 7, "07": 7, "julio": 7,
+    "8": 8, "08": 8, "agosto": 8,
+    "9": 9, "09": 9, "septiembre": 9, "setiembre": 9,
+    "10": 10, "octubre": 10, "oct": 10,
+    "11": 11, "noviembre": 11, "nov": 11,
+    "12": 12, "diciembre": 12, "dic": 12,
+}
 
 
+# ─── Inicialización de Gemini ────────────────────────────────────────────────
 def init_client():
-    if not API_KEY:
+    """Crea e inicializa el cliente de Google GenAI."""
+    key = os.environ.get("GEMINI_API_KEY", "").strip() or API_KEY
+    if not key or key in ("TU_CLAVE_API_AQUI", "None", ""):
+        print("=" * 60)
+        print("⚠  ATENCIÓN: No se ha detectado la variable de entorno GEMINI_API_KEY.")
+        print("   Asegúrate de configurarla en los secretos de tu repositorio GitHub")
+        print("   (Settings > Secrets and variables > Actions > GEMINI_API_KEY)")
+        print("   o definirla en el entorno antes de ejecutar.")
+        print("=" * 60)
         sys.exit(1)
-    return genai.Client(api_key=API_KEY)
+    return genai.Client(api_key=key)
 
 
 def select_model(client):
+    """
+    Selección inteligente de modelo con respaldo.
+    Prueba los modelos preferidos y devuelve una tupla (primario, respaldo).
+    """
+    funcionales = []
     for model_name in PREFERRED_MODELS:
         try:
-            response = client.models.generate_content(model=model_name, contents="Responde solo: OK")
+            print(f"  Probando modelo: {model_name} ...", end=" ")
+            response = client.models.generate_content(
+                model=model_name, contents="Responde solo: OK",
+            )
             if response and response.text:
-                return model_name, model_name
+                print("✔ disponible")
+                funcionales.append(model_name)
+                if len(funcionales) >= 2:
+                    break
+        except Exception as e:
+            print(f"✘ ({type(e).__name__})")
+
+    if funcionales:
+        return funcionales[0], funcionales[1] if len(funcionales) > 1 else funcionales[0]
+
+    # Búsqueda dinámica si ninguno preferido funcionó
+    print("\n  Buscando modelos dinámicamente en la cuenta...")
+    try:
+        for m in client.models.list():
+            name = m.name
+            if "gemini" not in name.lower():
+                continue
+            short = name.replace("models/", "")
+            try:
+                print(f"  Probando: {short} ...", end=" ")
+                resp = client.models.generate_content(model=short, contents="Responde solo: OK")
+                if resp and resp.text:
+                    print("✔ disponible")
+                    return short, short
+            except Exception:
+                print("✘")
+    except Exception as e:
+        print(f"  Error al listar modelos: {e}")
+
+    print("\n❌ No se encontró ningún modelo Gemini disponible.")
+    sys.exit(1)
+
+
+# ─── Consultas a la API del TSJ ──────────────────────────────────────────────
+def parse_fecha(f_str):
+    """Convierte cadena de fecha a objeto date."""
+    if not f_str:
+        return None
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(f_str.strip(), fmt).date()
         except Exception:
+            pass
+    return None
+
+
+def obtener_dias_publicados(session, sala_id=SALA_ID, ano=ANO_DEFAULT):
+    """
+    Consulta la API del TSJ para obtener todos los días con sentencias publicadas
+    para la sala y año indicados.
+    Retorna lista ordenada cronológicamente de dicts.
+    """
+    url = API_LIST_DAYS.format(base=TSJ_BASE, sala_id=sala_id, ano=ano)
+    try:
+        resp = session.get(url, headers=HEADERS, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        print(f"  ⚠ Error consultando días publicados del TSJ: {e}")
+        return []
+
+    dias_raw = data.get("coleccion", {}).get("DIA", [])
+    if isinstance(dias_raw, dict):
+        dias_raw = [dias_raw]
+
+    dias = []
+    for d in dias_raw:
+        fecha_str = d.get("FECHA", "").strip()
+        f_dt = parse_fecha(fecha_str)
+        if not f_dt:
             continue
-    return PREFERRED_MODELS[0], PREFERRED_MODELS[0]
+        try:
+            cuantas = int(d.get("CUANTAS", "0"))
+        except ValueError:
+            cuantas = 0
+
+        dias.append({
+            "fecha": fecha_str,
+            "fecha_dt": f_dt,
+            "cuantas": cuantas,
+            "mes_nombre": d.get("NOMBREMES", "").strip(),
+            "mes_num": int(d.get("NUMEROMES", f_dt.month)),
+            "dia": d.get("DIA", "").strip(),
+        })
+
+    # Ordenar cronológicamente
+    dias.sort(key=lambda x: x["fecha_dt"])
+    return dias
 
 
+def listar_sentencias_por_fecha(session, fecha_str, sala_id=SALA_ID):
+    """
+    Consulta la API JSON del portal Liferay para obtener la lista de
+    sentencias publicadas en una fecha y sala específicas.
+    """
+    fecha_encoded = quote(fecha_str, safe="")
+    url = API_LIST_DECISIONS.format(
+        base=TSJ_BASE, fecha_encoded=fecha_encoded, sala_id=sala_id
+    )
+
+    try:
+        resp = session.get(url, headers=HEADERS, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.RequestException as e:
+        print(f"    ⚠ Error consultando API del TSJ para {fecha_str}: {e}")
+        return []
+    except json.JSONDecodeError:
+        print(f"    ⚠ Respuesta no es JSON válido para {fecha_str}")
+        return []
+
+    coleccion = data.get("coleccion", {})
+    sentencias_raw = coleccion.get("SENTENCIA", [])
+    if isinstance(sentencias_raw, dict):
+        sentencias_raw = [sentencias_raw]
+
+    sentencias = []
+    for s in sentencias_raw:
+        nombre_doc = s.get("SSENTNOMBREDOC", "").strip()
+        if not nombre_doc:
+            continue
+
+        match = re.match(
+            r"(\d+)-(\d+)-(\d+)-(\d{4})-(.+?)\.HTML?",
+            nombre_doc, re.IGNORECASE
+        )
+        if match:
+            numero = match.group(2)
+            expediente = match.group(5)
+        else:
+            numero = "?"
+            expediente = s.get("SSENTEXPEDIENTE", "?")
+
+        nombre_mes = s.get("NOMBREMES", "").strip().lower()
+        sala_dir = s.get("SSALADIR", SALA_DIR).strip().lower()
+        doc_url = f"{TSJ_HISTORICO_BASE}/{sala_dir}/{nombre_mes}/{nombre_doc}"
+
+        sentencias.append({
+            "numero": numero,
+            "fecha": fecha_str,
+            "url": doc_url,
+            "expediente": expediente,
+            "ponente": s.get("SPONENOMBRE", "").strip(),
+            "procedimiento": s.get("SPROCDESCRIPCION", "").strip(),
+            "partes": s.get("SSENTPARTES", "").strip(),
+            "decision_resumen": s.get("SSENTDECISION", "").strip(),
+            "archivo": nombre_doc,
+        })
+
+    return sentencias
+
+
+def descargar_texto_sentencia(session, url):
+    """
+    Descarga y extrae el texto completo de una sentencia desde historico.tsj.gob.ve.
+    """
+    try:
+        resp = session.get(url, headers={
+            "User-Agent": HEADERS["User-Agent"],
+            "Accept": "text/html,application/xhtml+xml,*/*",
+        }, timeout=60)
+        resp.raise_for_status()
+
+        resp.encoding = resp.apparent_encoding or "latin-1"
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Eliminar elementos no textuales
+        for tag in soup(["script", "style", "meta", "link"]):
+            tag.decompose()
+
+        # Priorizar contenedor de texto de Word si existe
+        word_section = soup.find("div", class_="WordSection1")
+        if word_section:
+            text = word_section.get_text(separator="\n")
+        else:
+            body = soup.find("body")
+            text = body.get_text(separator="\n") if body else soup.get_text(separator="\n")
+
+        # Limpiar espacios en blanco excesivos
+        lines = [line.strip() for line in text.splitlines()]
+        text = "\n".join(line for line in lines if line)
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+
+        return text.strip()
+
+    except requests.RequestException as e:
+        print(f"    ⚠ Error descargando sentencia: {e}")
+        return ""
+
+
+def extraer_ponente_de_texto(texto, ponente_api=""):
+    """Extrae el ponente del texto de la sentencia si la API no lo entregó."""
+    if ponente_api:
+        return ponente_api
+    match = re.search(
+        r"[Pp]onente[:\s]+(?:Magistrad[oa]\s+)?(.+?)(?:\n|$)", texto
+    )
+    if match:
+        return re.sub(r"\s+", " ", match.group(1).strip().strip("."))
+    return ""
+
+
+# ─── Aislamiento del Capítulo Decisorio ──────────────────────────────────────
+def aislar_capitulo_decisorio(texto):
+    """
+    Aísla el capítulo decisorio de la sentencia, que corresponde al capítulo
+    inmediatamente anterior a la 'DECISIÓN', 'DISPOSITIVO' o 'DISPOSITIVA'.
+
+    En la estructura procesal de la Sala de Casación Penal del TSJ venezolano,
+    este capítulo es aquel donde los Magistrados analizan el fondo, resuelven
+    sobre la admisibilidad o inadmisibilidad, desestiman, declaran con o sin
+    lugar, o decretan la nulidad del fallo, formulando las razones y máximas
+    jurídicas originales de la Sala.
+
+    Oリング omite los antecedentes fácticos, las transcripciones de escritos de las
+    partes o jueces de instancia (capítulos iniciales) y el dispositivo resolutivo
+    final.
+
+    Retorna una tupla: (texto_capitulo, nombre_capitulo).
+    """
+    if not texto or len(texto) < 800:
+        return texto, "TEXTO_COMPLETO"
+
+    lines = [l.strip() for l in texto.splitlines() if l.strip()]
+    total_l = len(lines)
+
+    # 1. Localizar el inicio del capítulo final (DECISIÓN / DISPOSITIVO / DISPOSITIVA)
+    # Se busca desde el final hacia arriba, dentro del último 65% del documento
+    idx_final = -1
+    min_search_idx = max(int(total_l * 0.35), 0)
+
+    for i in range(total_l - 1, min_search_idx, -1):
+        l_u = lines[i].upper()
+        if re.search(r"^(?:[IVXLCDM]+\s*[-.:]?\s*)?(?:DECISI[OÓ]N|DISPOSITIV[OA]|PARTE\s+DISPOSITIV[OA])$", l_u):
+            if i > 0 and re.match(r"^[IVXLCDM]+$", lines[i - 1]):
+                idx_final = i - 1
+            else:
+                idx_final = i
+            break
+
+    # Si no se encontró por título explícito, buscar la fórmula sacramental de cierre
+    if idx_final == -1:
+        for i in range(total_l - 1, min_search_idx, -1):
+            l_u = lines[i].upper()
+            if any(l_u.startswith(p) for p in [
+                "POR LAS RAZONES EXPUESTAS",
+                "POR LAS RAZONES PRECEDENTEMENTE",
+                "POR LOS MOTIVOS EXPUESTOS",
+                "POR LOS MOTIVOS ANTES EXPUESTOS",
+                "ADMINISTRANDO JUSTICIA EN NOMBRE DE LA REPÚBLICA"
+            ]):
+                idx_final = i
+                break
+
+    if idx_final == -1:
+        # No se pudo ubicar el capítulo final con certeza
+        return texto, "TEXTO_COMPLETO"
+
+    # 2. Localizar el inicio del capítulo inmediatamente anterior
+    # Se busca hacia atrás desde idx_final
+    idx_inicio = -1
+    titulo = ""
+
+    for i in range(idx_final - 1, 0, -1):
+        l = lines[i]
+        if len(l) > 90:
+            continue
+        # Excluir menciones de cédulas venezolanas tipo "V- 12.345.678"
+        if re.match(r"^V\s*-\s*\d+", l, re.IGNORECASE):
+            continue
+
+        l_u = l.upper()
+
+        # Caso A: Número romano solo en su línea (ej: "VI", "V", "IV", "III")
+        if re.match(r"^[IVXLCDM]+$", l):
+            sig = lines[i + 1] if i + 1 < idx_final else ""
+            idx_inicio = i
+            titulo = f"{l} - {sig}" if sig and len(sig) < 80 else l
+            break
+
+        # Caso B: Número romano con título en la misma línea (ej: "VI. CONSIDERACIONES PARA DECIDIR")
+        if re.match(r"^[IVXLCDM]+\s*[-.:]\s*.+$", l):
+            idx_inicio = i
+            titulo = l
+            break
+
+        # Caso C: Título temático estándar en mayúsculas sin número romano
+        if any(l_u.startswith(k) for k in [
+            "CONSIDERACIONES PARA DECIDIR", "CONSIDERACIONES DE LA SALA",
+            "MOTIVACIÓN PARA DECIDIR", "DE LA ADMISIBILIDAD",
+            "DE LA FUNDAMENTACIÓN", "DE LA PROCEDENCIA",
+            "ESTA SALA OBSERVA", "ESTA SALA CONSIDERA"
+        ]):
+            idx_inicio = i
+            titulo = l
+            if i > 0 and re.match(r"^[IVXLCDM]+$", lines[i - 1]):
+                idx_inicio = i - 1
+                titulo = f"{lines[i - 1]} - {l}"
+            break
+
+    # 3. Validar y construir el texto aislado
+    if idx_inicio != -1 and idx_inicio < idx_final:
+        cap_lineas = lines[idx_inicio:idx_final]
+        texto_cap = "\n".join(cap_lineas).strip()
+        if len(texto_cap) >= 400:
+            return texto_cap, titulo
+
+    # Fallback seguro: si no se detectó el encabezado del capítulo previo,
+    # pero sí el de la DECISIÓN, tomamos el bloque inmediatamente anterior a la decisión
+    if idx_final > 0:
+        texto_previo = "\n".join(lines[:idx_final]).strip()
+        if len(texto_previo) >= 400:
+            return texto_previo, "SECCIÓN_PREVIA_A_DECISIÓN"
+
+    return texto, "TEXTO_COMPLETO"
+
+
+# ─── Chunking ────────────────────────────────────────────────────────────────
+def chunk_text(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+    """Divide texto en fragmentos con solapamiento."""
+    if len(text) <= size:
+        return [text]
+    chunks = []
+    step = size - overlap
+    for i in range(0, len(text), step):
+        chunks.append(text[i : i + size])
+        if i + size >= len(text):
+            break
+    return chunks
+
+
+# ─── Clasificación de Tipo de Decisión y Pauta de Máximas ────────────────────
+def clasificar_pauta_decision(info, texto=""):
+    """
+    Determina la categoría de la decisión y la pauta de extracción de máximas
+    según las reglas establecidas:
+      1. Extradiciones: No tomar nada (0 máximas).
+      2. Inadmisible o Desestimado: Tomar como máximo una (1) máxima.
+      3. Con Lugar o Nulidad (incluye nulidad de oficio): Tomar entre 2 y 4 máximas.
+      4. Otros: Pauta estándar (máximo 2 máximas).
+
+    Retorna: (categoria, min_maximas, max_maximas, instruccion_prompt)
+    """
+    proc = (info.get("procedimiento") or "").lower()
+    resumen = (info.get("decision_resumen") or "").lower()
+    exp = (info.get("expediente") or "").upper()
+
+    # 1. Extradición (omisión completa: 0 máximas)
+    if (
+        "extradici" in proc
+        or exp.startswith("E")
+        or "extradici" in resumen
+        or "procedimiento de extradición" in (texto[:1200].lower() if texto else "")
+    ):
+        return (
+            "EXTRADICION",
+            0,
+            0,
+            "EXTRADICIÓN: No tomar ninguna máxima jurídica (0 máximas)."
+        )
+
+    # Texto complementario para análisis de fondo y dispositivo resolutivo
+    corpus = resumen + " " + (texto[-4000:].lower() if texto else "")
+
+    # 2. Con Lugar o Nulidad (incluye nulidad de oficio)
+    patrones_con_lugar_nulidad = [
+        "con lugar",
+        "ha lugar",
+        "de oficio la nulidad",
+        "nulidad de oficio",
+        "decreta de oficio",
+        "decreta la nulidad",
+        "anula de oficio",
+        "declarar la nulidad",
+        "se anula",
+    ]
+    es_con_lugar_o_nulidad = any(p in corpus for p in patrones_con_lugar_nulidad)
+
+    # 3. Inadmisible o Desestimado
+    patrones_inadmisible_desestimado = [
+        "inadmisible",
+        "inadmisibilidad",
+        "desestima",
+        "desestimado",
+        "desestimar",
+        "desestimación",
+        "manifiestamente infundad",
+    ]
+    es_inadmisible_o_desestimado = any(p in corpus for p in patrones_inadmisible_desestimado)
+
+    # Prevalencia: si la decisión decreta una nulidad o declara con lugar (incluso al desestimar
+    # otra denuncia concurrente), se jerarquiza el pronunciamiento de fondo
+    if es_con_lugar_o_nulidad:
+        instruccion = (
+            "PAUTA OBLIGATORIA DE CANTIDAD (DECISIÓN CON LUGAR O NULIDAD DE OFICIO):\n"
+            "Esta sentencia declara CON LUGAR un recurso/solicitud o decreta de oficio una NULIDAD. "
+            "Debes extraer ENTRE 2 Y 4 MÁXIMAS JURÍDICAS que desarrollen y motiven los criterios "
+            "jurídicos de fondo sentados por la Sala."
+        )
+        return "CON_LUGAR_O_NULIDAD", 2, 4, instruccion
+
+    if es_inadmisible_o_desestimado:
+        instruccion = (
+            "PAUTA OBLIGATORIA DE CANTIDAD (DECISIÓN INADMISIBLE O DESESTIMADA):\n"
+            "Esta sentencia declara INADMISIBLE o DESESTIMA por infundado un recurso o solicitud. "
+            "Debes tomar COMO MÁXIMO UNA (1) MÁXIMA JURÍDICA (únicamente el criterio doctrinal más "
+            "relevante sobre la causal de inadmisibilidad o desestimación). Si no sienta doctrina "
+            "relevante o solo aplica requisitos formales obvios, devuelve lista vacía []. "
+            "BAJO NINGUNA CIRCUNSTANCIA extraigas más de una (1) máxima."
+        )
+        return "INADMISIBLE_O_DESESTIMADO", 0, 1, instruccion
+
+    # Otros procedimientos ordinarios
+    instruccion = (
+        "PAUTA DE CANTIDAD:\n"
+        "Extrae únicamente las máximas jurídicas necesarias y relevantes (máximo 2)."
+    )
+    return "ORDINARIO", 1, 2, instruccion
+
+
+# ─── Prompt de Extracción de Máximas ─────────────────────────────────────────
+MAXIMAS_PROMPT = """Actúa como un experto en Derecho Procesal Penal venezolano.
+Estás analizando el CAPÍTULO DECISORIO de una sentencia de la Sala de Casación Penal
+del Tribunal Supremo de Justicia de Venezuela (la sección donde la Sala motiva y toma
+la decisión de desestimar el recurso, declararlo inadmisible o admitirlo, decretar
+una nulidad, etc., ubicada inmediatamente antes de la parte resolutiva/dispositiva).
+
+Tu tarea es extraer las MÁXIMAS JURÍDICAS (extractos doctrinarios originales relevantes)
+contenidas en este capítulo de decisión.
+
+DEFINICIÓN DE MÁXIMA JURÍDICA:
+Una máxima es un párrafo o conjunto de párrafos de la propia redacción de la
+sentencia donde la Sala sienta un criterio jurídico relevante, una interpretación
+normativa, un principio de derecho procesal/penal, ratio decidendi o doctrina.
+Son textos ORIGINALES formulados por la Sala en esta decisión (no citas de
+otras sentencias ni transcripciones de alegatos de las partes).
+
+DATOS DE ESTA SENTENCIA:
+- Número: {numero}
+- Sala: Sala de Casación Penal
+- Fecha: {fecha}
+- Ponente: {ponente}
+
+PAUTA OBLIGATORIA PARA ESTA SENTENCIA:
+{instruccion_pauta}
+
+Para cada máxima encontrada, devuelve un objeto JSON con estas claves:
+
+- "numero": "{numero}" (siempre el número de esta sentencia)
+- "sala": "Sala de Casación Penal"
+- "fecha": "{fecha}"
+- "tema": Materia o punto jurídico específico. Frase concisa de 2 a 8 palabras
+  (ej: "Inadmisibilidad del recurso de casación", "Desestimación por manifiestamente infundado",
+  "Falta de fundamentación fáctica", "Principio de intervención mínima", "Nulidad absoluta de oficio", etc.).
+- "extracto": Resumen claro (3-5 líneas) del criterio jurídico expuesto por la Sala.
+- "contenido_citado": Texto COMPLETO Y SUSTANTIVO de la máxima tal como la
+  redactó la Sala. Debe ser un párrafo o conjunto de párrafos con contenido
+  doctrinario suficientemente extenso y autónomo (mínimo 150 caracteres).
+  NO incluyas encabezados procedimentales, citas textuales de terceros ni el dispositivo resolutivo.
+- "ratificaciones": Si en esta máxima la Sala ratifica o reitera un criterio
+  de sentencia(s) previa(s), indicar aquí (ej: "Ratifica a Sentencia N° 348
+  del 25/06/2007"). Si no, dejar cadena vacía "".
+
+REGLAS DE EXCLUSIÓN (MUY IMPORTANTE):
+1. NO extraigas transcripciones de escritos del recurrente, denuncias, alegatos
+   de las partes, ni actos de los tribunales de instancia.
+2. NO extraigas la parte dispositiva del fallo (PRIMERO: ..., SEGUNDO: ...).
+3. NO extraigas encabezados ni datos de identificación del expediente.
+4. NO extraigas citas textuales de OTRAS sentencias (esas son citas ajenas, no máximas
+   originarias de esta sentencia). Si la Sala transcribe párrafos entrecomillados o
+   textuales de una sentencia anterior, eso NO es una máxima de esta decisión.
+5. SÍ extrae párrafos donde la Sala establece CRITERIOS PROPIOS, interpreta
+   normas, fija doctrina o razona jurídicamente el caso concreto.
+6. Cada máxima debe tener al menos 150 caracteres de contenido sustantivo.
+
+Devuelve ÚNICAMENTE un JSON válido: una lista de objetos.
+NO incluyas texto adicional, explicaciones, markdown ni bloques de código.
+Si no encuentras máximas válidas, devuelve: []
+
+TEXTO DEL CAPÍTULO DECISORIO:
+"""
+
+JSON_ARRAY_RE = re.compile(r"\[.*\]", re.DOTALL)
+
+
+def extract_maximas(client, primary_model, fallback_model, text_chunk,
+                    numero, fecha, ponente, instruccion_pauta="", max_permitidas=0,
+                    max_retries=4):
+    """
+    Envía el texto de una sentencia al modelo para extraer máximas originales.
+    Retorna (maximas_list, exito, error_msg).
+    """
+    prompt = MAXIMAS_PROMPT.format(
+        numero=numero, fecha=fecha, ponente=ponente,
+        instruccion_pauta=instruccion_pauta
+    ) + text_chunk
+
+    current_model = primary_model
+    last_error = ""
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = client.models.generate_content(
+                model=current_model, contents=prompt,
+            )
+            raw = (response.text or "").strip()
+            if not raw:
+                raise ValueError("Respuesta vacía del modelo.")
+
+            sentencias = None
+            try:
+                data = json.loads(raw)
+                if isinstance(data, list):
+                    sentencias = data
+            except json.JSONDecodeError:
+                pass
+
+            if sentencias is None:
+                match = JSON_ARRAY_RE.search(raw)
+                if match:
+                    try:
+                        data = json.loads(match.group())
+                        if isinstance(data, list):
+                            sentencias = data
+                    except json.JSONDecodeError:
+                        pass
+
+            if sentencias is not None:
+                # Aplicar límite máximo si corresponde
+                if max_permitidas > 0 and len(sentencias) > max_permitidas:
+                    sentencias = sentencias[:max_permitidas]
+                return sentencias, True, ""
+            else:
+                last_error = "Formato JSON no interpretable."
+                continue
+
+        except Exception as e:
+            error_msg = str(e)
+            last_error = error_msg
+            is_busy = any(
+                k in error_msg
+                for k in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"]
+            )
+            if is_busy:
+                if fallback_model and current_model != fallback_model:
+                    print(f"\n    ⚠️ {current_model} saturado → {fallback_model}", end=" ")
+                    current_model = fallback_model
+                elif fallback_model and current_model == fallback_model and primary_model != fallback_model:
+                    current_model = primary_model
+                wait = 4 * attempt
+                if attempt < max_retries:
+                    print(f"\n    ⏳ Reintentando en {wait}s...", end=" ")
+                    time.sleep(wait)
+                    continue
+            else:
+                print(f"\n    ⚠ Error ({current_model}): {e}")
+                time.sleep(2)
+
+    return [], False, last_error
+
+
+# ─── Base de Datos y Seguimiento ─────────────────────────────────────────────
 def init_db():
+    """Inicializa tablas en SQLite."""
     conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
+    c = conn.cursor()
+    c.execute("""
         CREATE TABLE IF NOT EXISTS sentencias (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             numero TEXT NOT NULL,
@@ -163,8 +741,8 @@ def init_db():
             archivo_origen TEXT
         )
     """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_sentencias_num_sala ON sentencias(numero, sala)")
-    cursor.execute("""
+    c.execute("CREATE INDEX IF NOT EXISTS idx_sentencias_num_sala ON sentencias(numero, sala)")
+    c.execute("""
         CREATE TABLE IF NOT EXISTS estado_bloques (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             archivo TEXT NOT NULL,
@@ -177,413 +755,719 @@ def init_db():
             UNIQUE(archivo, bloque_idx)
         )
     """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS control_fechas_web (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            ultima_fecha_revisada TEXT NOT NULL,
-            fecha_actualizacion TEXT NOT NULL
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS control_web (
+            clave TEXT PRIMARY KEY,
+            valor TEXT,
+            fecha_actualizacion TEXT
         )
     """)
     conn.commit()
     return conn
 
 
-def obtener_rango_fechas(conn):
-    hoy_ve = datetime.now(TZ_VENEZUELA).date()
-    cursor = conn.cursor()
-    cursor.execute("SELECT ultima_fecha_revisada FROM control_fechas_web WHERE id = 1")
-    row = cursor.fetchone()
-    if not row or not row[0]:
-        fecha_inicio = FECHA_INICIO_INICIAL
-    else:
-        ultima = datetime.strptime(row[0], "%Y-%m-%d").date()
-        fecha_inicio = ultima + timedelta(days=1)
-    return fecha_inicio, hoy_ve
+def obtener_control(conn, clave, default=None):
+    """Lee un valor de la tabla de control."""
+    cur = conn.cursor()
+    cur.execute("SELECT valor FROM control_web WHERE clave = ?", (clave,))
+    r = cur.fetchone()
+    return r[0] if r else default
 
 
-def actualizar_ultima_fecha_revisada(conn, fecha_obj):
-    ahora_str = datetime.now(TZ_VENEZUELA).strftime("%Y-%m-%d %H:%M:%S")
-    fecha_str = fecha_obj.strftime("%Y-%m-%d")
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO control_fechas_web (id, ultima_fecha_revisada, fecha_actualizacion)
-        VALUES (1, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-            ultima_fecha_revisada = excluded.ultima_fecha_revisada,
-            fecha_actualizacion = excluded.fecha_actualizacion
-    """, (fecha_str, ahora_str))
+def guardar_control(conn, clave, valor):
+    """Guarda o actualiza un valor de control."""
+    conn.cursor().execute(
+        """
+        INSERT INTO control_web (clave, valor, fecha_actualizacion)
+        VALUES (?, ?, datetime('now', 'localtime'))
+        ON CONFLICT(clave) DO UPDATE SET
+            valor = excluded.valor,
+            fecha_actualizacion = datetime('now', 'localtime')
+        """,
+        (clave, str(valor)),
+    )
     conn.commit()
 
 
-def url_ya_procesada(conn, identificador_origen):
-    cursor = conn.cursor()
-    cursor.execute("SELECT 1 FROM estado_bloques WHERE archivo = ? AND estado = 'EXITOSO' LIMIT 1", (identificador_origen,))
-    return cursor.fetchone() is not None
+def normalizar_texto(texto):
+    """Normaliza texto para comparación semántica."""
+    if not texto:
+        return ""
+    texto = unicodedata.normalize("NFKD", str(texto)).encode("ascii", "ignore").decode("utf-8").lower()
+    return re.sub(r"[^\w\s]", " ", texto).strip()
 
 
-def guardar_estado_bloque(conn, archivo, estado, sentencias_detectadas=0, error_detalle=""):
-    ahora_str = datetime.now(TZ_VENEZUELA).strftime("%Y-%m-%d %H:%M:%S")
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO estado_bloques (archivo, bloque_idx, total_bloques, estado, sentencias_detectadas, error_detalle, fecha_actualizacion)
-        VALUES (?, 1, 1, ?, ?, ?, ?)
-        ON CONFLICT(archivo, bloque_idx) DO UPDATE SET
-            estado = excluded.estado,
-            sentencias_detectadas = excluded.sentencias_detectadas,
-            error_detalle = excluded.error_detalle,
-            fecha_actualizacion = excluded.fecha_actualizacion
-    """, (archivo, estado, sentencias_detectadas, error_detalle, ahora_str))
-    conn.commit()
+def son_mismo_tema(tema1, extracto1, tema2, extracto2, citado1="", citado2=""):
+    """Evalúa si dos extractos corresponden al mismo tema."""
+    c1 = normalizar_texto(citado1)
+    c2 = normalizar_texto(citado2)
+    if c1 and c2:
+        if c1 in c2 or c2 in c1 or difflib.SequenceMatcher(None, c1, c2, autojunk=False).ratio() >= 0.65:
+            return True
+
+    t1 = normalizar_texto(tema1)
+    t2 = normalizar_texto(tema2)
+    e1 = normalizar_texto(extracto1)
+    e2 = normalizar_texto(extracto2)
+
+    if t1 and t2:
+        sw = {"de","la","el","los","las","en","por","del","un","una","y","o","a","al","para","con","sobre"}
+        p1 = set(t1.split()) - sw
+        p2 = set(t2.split()) - sw
+        rt = difflib.SequenceMatcher(None, t1, t2, autojunk=False).ratio()
+        if rt >= 0.65 or (p1 and p2 and len(p1 & p2) >= min(len(p1), len(p2))):
+            return True
+        if rt < 0.45 and (not p1 or not p2 or not (p1 & p2)):
+            return False
+
+    if difflib.SequenceMatcher(None, e1, e2, autojunk=False).ratio() >= 0.55:
+        return True
+
+    pe1 = set(w for w in e1.split() if len(w) > 4)
+    pe2 = set(w for w in e2.split() if len(w) > 4)
+    if pe1 and pe2:
+        j = len(pe1 & pe2) / len(pe1 | pe2)
+        if j >= 0.45:
+            return True
+    return False
 
 
-def limpiar_y_validar_registro(s):
+VALORES_VACIOS = {
+    "", "sin cita", "sin cita textual", "sin cita textual expresa",
+    "no aplica", "ninguno", "sin máxima", "sin contenido",
+}
+
+FRASES_INVALIDAS = [
+    "sin cita", "omite la transcripcion", "omite la transcripción",
+    "primero: competente",
+]
+
+
+def limpiar_y_validar_maxima(s, numero_esperado=""):
+    """Normaliza y valida una máxima jurídica."""
     if not isinstance(s, dict):
         return None
-    raw_numero = str(s.get("numero", "")).replace(".", "").strip()
-    num_limpio = raw_numero.lstrip("0") or "0"
-    if not num_limpio.isdigit() or num_limpio == "0":
+
+    raw = str(s.get("numero", "")).replace(".", "").strip()
+    num = raw.lstrip("0") or "0"
+    if not num.isdigit() or num == "0":
         return None
-    sala = str(s.get("sala", "")).strip()
-    if sala not in {"Sala de Casación Penal", "Sala Constitucional"}:
+    if numero_esperado and num != numero_esperado:
+        num = numero_esperado
+
+    sala = str(s.get("sala", SALA_NOMBRE)).strip() or SALA_NOMBRE
+    citado = str(s.get("contenido_citado", "")).strip()
+
+    if citado.lower() in VALORES_VACIOS or len(citado) < 150:
         return None
-    contenido_citado = str(s.get("contenido_citado", "")).strip().strip('"“”«»\'')
-    if len(contenido_citado) < 150:
+    if citado.endswith(":") or citado.endswith("[...]"):
         return None
+    if any(f in citado.lower() for f in FRASES_INVALIDAS):
+        return None
+
+    # Ratificaciones
+    rr = s.get("ratificaciones", "")
+    if isinstance(rr, dict):
+        pp = []
+        if rr.get("ratifica_a"):
+            pp.append(f"Ratifica a: {rr['ratifica_a']}")
+        if rr.get("ratificada_por"):
+            pp.append(f"Ratificada por: {rr['ratificada_por']}")
+        rs = " | ".join(pp)
+    else:
+        rs = str(rr or "").strip()
+
+    # Filtrar autorratificaciones
+    if rs:
+        sin_fechas = re.sub(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b", "", rs)
+        nums = re.findall(r"\b\d+\b", sin_fechas)
+        if nums and set(nums) == {num}:
+            rs = ""
+
     return {
-        "numero": num_limpio,
+        "numero": num,
         "sala": sala,
         "fecha": str(s.get("fecha", "")).strip(),
         "tema": str(s.get("tema", "")).strip(),
         "extracto": str(s.get("extracto", "")).strip(),
-        "contenido_citado": contenido_citado,
-        "ratificaciones": str(s.get("ratificaciones", "") or "").strip(),
+        "contenido_citado": citado,
+        "ratificaciones": rs,
     }
 
 
-def insert_sentencias(conn, sentencias, archivo_origen):
-    cursor = conn.cursor()
-    inserted = 0
-    updated = 0
-    duplicated = 0
-    for s in sentencias[:MAX_MAXIMAS_POR_SENTENCIA]:
-        reg = limpiar_y_validar_registro(s)
-        if not reg:
-            continue
-        cursor.execute(
-            "SELECT id FROM sentencias WHERE numero = ? AND sala = ?",
-            (reg["numero"], reg["sala"]),
+def actualizar_ratificaciones_ratificada_por(texto_actual, nuevo_num, nueva_fecha):
+    """
+    Actualiza la cadena de ratificaciones para reflejar que el criterio fue ratificado
+    por una nueva sentencia ('nuevo_num', 'nueva_fecha').
+
+    Regla estricta:
+      - Coloca como máximo DOS (2) sentencias ratificadoras.
+      - La última ratificación SIEMPRE debe quedar en el segundo apartado.
+    """
+    nuevo_num_clean = str(nuevo_num).lstrip("0") or "0"
+
+    parte_ratifica_a = ""
+    m_a = re.search(r"(Ratifica\s+(?:a|la)\s+[^|]+)", texto_actual or "", re.I)
+    if m_a:
+        parte_ratifica_a = m_a.group(1).strip()
+
+    ratifs_existentes = []
+    m_por = re.search(r"Ratificada\s+(?:por|en)\s+(.+?)(?:$|\|)", texto_actual or "", re.I)
+    if m_por:
+        bloque = m_por.group(1)
+        encontrados = re.findall(
+            r"(?:Sentencias?|número|N[°ºo.]?|\b)\s*(\d+)(?:\s+(?:del?|de fecha)\s+([0-9/a-záéíóú\s]+?))?(?=\s*(?:y\s+|,\s*|$))",
+            bloque, re.I
         )
-        if cursor.fetchone() is None:
-            cursor.execute(
-                """
-                INSERT INTO sentencias (numero, sala, fecha, tema, extracto, contenido_citado, ratificaciones, archivo_origen)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (reg["numero"], reg["sala"], reg["fecha"], reg["tema"], reg["extracto"], reg["contenido_citado"], reg["ratificaciones"], archivo_origen),
-            )
-            inserted += 1
-        else:
-            duplicated += 1
-    conn.commit()
-    return inserted, updated, duplicated
+        for num, f in encontrados:
+            num_c = num.lstrip("0") or "0"
+            f_c = f.strip() if f else ""
+            if num_c != nuevo_num_clean and not any(r[0] == num_c for r in ratifs_existentes):
+                ratifs_existentes.append((num_c, f_c))
+
+    nueva_fecha_clean = str(nueva_fecha).strip() if nueva_fecha else ""
+    ratifs_existentes.append((nuevo_num_clean, nueva_fecha_clean))
+
+    # Mantener como máximo 2, quedando siempre la última en el segundo apartado
+    if len(ratifs_existentes) > 2:
+        ratifs_existentes = [ratifs_existentes[0], ratifs_existentes[-1]]
+
+    if len(ratifs_existentes) == 1:
+        n, f = ratifs_existentes[0]
+        ftxt = f" del {f}" if f else ""
+        parte_por = f"Ratificada por Sentencia N° {n}{ftxt}"
+    else:
+        n1, f1 = ratifs_existentes[0]
+        n2, f2 = ratifs_existentes[1]
+        f1txt = f" del {f1}" if f1 else ""
+        f2txt = f" del {f2}" if f2 else ""
+        parte_por = f"Ratificada por Sentencias N° {n1}{f1txt} y N° {n2}{f2txt}"
+
+    if parte_ratifica_a:
+        return f"{parte_ratifica_a} | {parte_por}"
+    return parte_por
 
 
-def descargar_texto_sentencia(url):
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/128.0.0.0"}
-    for _ in range(2):
-        try:
-            resp = requests.get(url, headers=headers, verify=False, timeout=25)
-            if resp.status_code == 200:
-                soup = BeautifulSoup(resp.content.decode("utf-8", errors="replace"), "html.parser")
-                for tag in soup(["script", "style"]):
-                    tag.decompose()
-                return "\n".join([re.sub(r"\s+", " ", ln).strip() for ln in soup.get_text(separator="\n").splitlines() if ln.strip()])
-        except Exception:
-            time.sleep(2)
-    return ""
+def es_misma_maxima_inter_sentencia(r_nuevo, fila_existente):
+    """
+    Determina si una máxima extraída de una nueva sentencia corresponde a un criterio/máxima
+    que ya fue sentado en una sentencia previa existente en la base de datos.
+    """
+    ex_id, ex_num, ex_sala, ex_fecha, ex_tema, ex_ext, ex_cit, ex_ratif = fila_existente
 
+    num_nuevo = str(r_nuevo.get("numero", "")).lstrip("0") or "0"
+    num_ex = str(ex_num).lstrip("0") or "0"
+    if num_nuevo == num_ex:
+        return False
 
-def extraer_metadatos_cabecera(texto, url, sala_nombre, fecha_obj):
-    numero = ""
-    m_url = re.search(r"/\d+-([A-Za-z.]*0*\d+)-\d{5,6}-\d{4}", url)
-    if m_url:
-        numero = re.sub(r"\D", "", m_url.group(1)).lstrip("0")
-    return {"numero": numero, "sala": sala_nombre, "fecha": fecha_obj.strftime("%d/%m/%Y")}
-
-
-def evaluar_pertinencia_y_nulidad(texto_completo, resumen_portal, sala_nombre):
-    texto_busqueda = f"{resumen_portal}\n{texto_completo}".lower()
-    if sala_nombre == "Sala Constitucional" and sum(1 for kw in KEYWORDS_MATERIA_PENAL if kw in texto_busqueda) < 2:
-        return False, False, 0
-    tiene_nulidad = any(kw in texto_busqueda for kw in KEYWORDS_NULIDAD)
-    return True, tiene_nulidad, 1
-
-
-def recortar_seccion_relevante(texto):
-    if len(texto) <= MAX_CHARS_SENTENCIA:
-        return texto
-    return texto[:3500] + "\n\n[...]\n\n" + texto[-(MAX_CHARS_SENTENCIA - 4000):]
-
-
-def cargar_pagina_tsj_con_reintentos(page, url, menu_texto):
-    for intento in range(1, 4):
-        try:
-            print(f"    🔄 Cargando {url} (intento {intento}/3)...")
-            page.goto(url, timeout=60000, wait_until="commit")
-            # Esperar a que cargue el DOM general sin exigir un texto estricto
-            page.wait_for_load_state("domcontentloaded", timeout=45000)
-            page.wait_for_timeout(4000)
-
-            # Intentar hacer clic en la pestaña de la sala si existe
-            enlace_sala = page.locator(f"a:text-is('{menu_texto}')").first
-            if enlace_sala.count() > 0:
-                enlace_sala.click(timeout=10000)
-                page.wait_for_timeout(3000)
-
+    # 1. Mención expresa en ratificaciones: "Ratifica a Sentencia N° X"
+    ratif_nueva = str(r_nuevo.get("ratificaciones", "") or "")
+    if ratif_nueva:
+        ratif_sin_fechas = re.sub(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b", "", ratif_nueva)
+        nums_ratif = [n.lstrip("0") for n in re.findall(r"\b\d+\b", ratif_sin_fechas)]
+        if num_ex in nums_ratif:
             return True
-        except Exception as e:
-            print(f"    ⚠ Intento {intento} demorado o reintentando: {str(e)[:80]}")
-            time.sleep(4)
+
+    # 2. Contenido citado idéntico o muy similar
+    c_nuevo = normalizar_texto(r_nuevo.get("contenido_citado", ""))
+    c_ex = normalizar_texto(ex_cit)
+    if c_nuevo and c_ex and len(c_nuevo) >= 120 and len(c_ex) >= 120:
+        if c_nuevo in c_ex or c_ex in c_nuevo:
+            return True
+        ratio_citado = difflib.SequenceMatcher(None, c_nuevo, c_ex, autojunk=False).ratio()
+        if ratio_citado >= 0.65:
+            return True
+
+    # 3. Tema idéntico y extracto con alta similitud
+    t_nuevo = normalizar_texto(r_nuevo.get("tema", ""))
+    t_ex = normalizar_texto(ex_tema)
+    e_nuevo = normalizar_texto(r_nuevo.get("extracto", ""))
+    e_ex = normalizar_texto(ex_ext)
+
+    if t_nuevo and t_ex:
+        ratio_tema = difflib.SequenceMatcher(None, t_nuevo, t_ex, autojunk=False).ratio()
+        if ratio_tema >= 0.75:
+            ratio_ext = difflib.SequenceMatcher(None, e_nuevo, e_ex, autojunk=False).ratio()
+            if ratio_ext >= 0.60:
+                return True
+
     return False
 
 
-def obtener_dias_publicados_en_vista(page, anio_objetivo):
-    datos_dom = page.evaluate("""() => {
-        const mesesValid = ['enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio', 'julio', 'agosto', 'septiembre', 'setiembre', 'octubre', 'noviembre', 'diciembre'];
-        const hallados = [];
-        const candidatos = Array.from(document.querySelectorAll('tr, div, li'));
-        for (const cont of candidatos) {
-            const textoDirecto = (cont.innerText || '').trim();
-            if (!textoDirecto || textoDirecto.length > 250) continue;
-            const lineas = textoDirecto.split(/\\n+/).map(s => s.trim()).filter(Boolean);
-            if (lineas.length < 2) continue;
-            const posibleMes = lineas[0].toLowerCase();
-            if (!mesesValid.includes(posibleMes)) continue;
-            const dias = [];
-            for (let i = 1; i < lineas.length; i++) {
-                if (/^(0?[1-9]|[12][0-9]|3[01])$/.test(lineas[i])) dias.push(lineas[i]);
-            }
-            if (dias.length > 0) hallados.push({ mes_lower: posibleMes, dias: dias });
-        }
-        return hallados;
-    }""")
+def insert_maximas(conn, maximas, archivo_origen):
+    """
+    Inserta o enriquece máximas en la base de datos.
+    Aplica regla anti-duplicados entre sentencias distintas:
+    si la máxima ya existe en otra sentencia, no se inserta como fila nueva,
+    sino que se anota la ratificación en el registro original existente.
+    """
+    cur = conn.cursor()
+    ins = upd = dup = 0
 
-    resultado = []
-    vistos = set()
-    for item in datos_dom:
-        mes_num = MESES_NOMBRE_A_NUM.get(item["mes_lower"])
-        if not mes_num:
+    for s in maximas:
+        r = limpiar_y_validar_maxima(s)
+        if r is None:
             continue
-        for d_str in item["dias"]:
-            try:
-                f_obj = date(anio_objetivo, mes_num, int(d_str))
-                if f_obj not in vistos:
-                    vistos.add(f_obj)
-                    resultado.append((f_obj, item["mes_lower"], d_str))
-            except ValueError:
-                continue
-    return sorted(resultado, key=lambda x: x[0])
 
-
-def buscar_decisiones_en_portal_tsj(fecha_inicio, fecha_fin):
-    resultados_por_fecha = {}
-    anios_necesarios = sorted({y for y in range(fecha_inicio.year, fecha_fin.year + 1)})
-    portal_accesible = False
-
-    print("\n🌐 Iniciando navegador local en segundo plano para consultar el TSJ...")
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
+        # ── 1) Buscar si coincide con la MISMA sentencia ──
+        cur.execute(
+            "SELECT id, COALESCE(tema,''), extracto, contenido_citado, fecha, "
+            "COALESCE(ratificaciones,'') FROM sentencias WHERE numero=? AND sala=?",
+            (r["numero"], r["sala"]),
         )
-        context = browser.new_context(ignore_https_errors=True, viewport={"width": 1366, "height": 900})
-        page = context.new_page()
+        existentes_misma_sentencia = cur.fetchall()
 
-        for sala_info in SALAS_OBJETIVO:
-            sala_nombre = sala_info["nombre_bd"]
-            menu_texto = sala_info["menu_texto"]
-            codigo_sala = sala_info["codigo"]
-            url_sala = sala_info["url"]
+        coincidente = None
+        for fila in existentes_misma_sentencia:
+            fid, et, ee, ec, ef, er = fila
+            if son_mismo_tema(r["tema"], r["extracto"], et, ee, r["contenido_citado"], ec):
+                coincidente = fila
+                break
 
-            print(f"\n🏛️  Consultando {sala_nombre} ({url_sala})...")
-            if not cargar_pagina_tsj_con_reintentos(page, url_sala, menu_texto):
-                print(f"    ❌ No fue posible conectar con {sala_nombre}.")
-                continue
+        if coincidente is not None:
+            # Enriquecer registro existente de la misma sentencia
+            rid, xt, xe, xc, xf, xr = coincidente
+            xc = xc or ""; xe = xe or ""; xf = xf or ""; xr = xr or ""
+            act = False
+            nt, nc, ne, nf, nr = xt, xc, xe, xf, xr
 
-            portal_accesible = True
+            if r["tema"] and not xt:
+                nt = r["tema"]; act = True
+            cvalid = r["contenido_citado"] and r["contenido_citado"].lower() not in VALORES_VACIOS
+            cvacio = not xc or xc.lower() in VALORES_VACIOS
+            if cvalid and (cvacio or len(r["contenido_citado"]) > len(xc)):
+                nc = r["contenido_citado"]; act = True
+            if r["extracto"] and (len(r["extracto"]) > len(xe) or ("ratifica" in r["extracto"].lower() and "ratifica" not in xe.lower())):
+                ne = r["extracto"]; act = True
+            if r["fecha"] and ("sin fecha" in xf.lower() or not xf):
+                nf = r["fecha"]; act = True
+            if r["ratificaciones"] and len(r["ratificaciones"]) > len(xr):
+                nr = r["ratificaciones"]; act = True
 
-            for anio in anios_necesarios:
-                try:
-                    select_anio = page.locator("select").first
-                    if select_anio.count() > 0:
-                        select_anio.select_option(label=str(anio))
-                        page.wait_for_timeout(3000)
-                except Exception:
-                    pass
+            if act:
+                cur.execute(
+                    "UPDATE sentencias SET tema=?,contenido_citado=?,extracto=?,"
+                    "fecha=?,ratificaciones=?,archivo_origen=? WHERE id=?",
+                    (nt, nc, ne, nf, nr, archivo_origen, rid),
+                )
+                upd += 1
+            else:
+                dup += 1
+            continue
 
-                dias_disponibles = obtener_dias_publicados_en_vista(page, anio)
-                dias_en_rango = [f for f in dias_disponibles if fecha_inicio <= f[0] <= fecha_fin]
+        # ── 2) Buscar si esta máxima ya fue sentada en OTRA sentencia previa ──
+        cur.execute(
+            "SELECT id, numero, sala, fecha, COALESCE(tema,''), extracto, contenido_citado, "
+            "COALESCE(ratificaciones,'') FROM sentencias WHERE sala = ? AND numero != ?",
+            (r["sala"], r["numero"]),
+        )
+        otras_sentencias = cur.fetchall()
 
-                for f_obj, mes_txt, dia_txt in dias_en_rango:
-                    fecha_ddmmyyyy = f_obj.strftime("%d/%m/%Y")
-                    resultados_por_fecha.setdefault(f_obj, [])
-                    try:
-                        hrefs_antes = set(page.evaluate(f"() => Array.from(document.querySelectorAll('a[href*=\"/decisiones/{codigo_sala}/\"]')).map(a => a.href)"))
-                        
-                        page.evaluate("""([mesTarget, diaTarget]) => {
-                            const contenedores = Array.from(document.querySelectorAll('tr, div, li'));
-                            for (const cont of contenedores) {
-                                const txt = (cont.innerText || '').trim();
-                                if (!txt || txt.length > 250) continue;
-                                const lineas = txt.split(/\\n+/).map(s => s.trim()).filter(Boolean);
-                                if (lineas.length < 2 || lineas[0].toLowerCase() !== mesTarget.toLowerCase()) continue;
-                                for (const el of cont.querySelectorAll('a, button, span, div')) {
-                                    if ((el.innerText || '').trim() === diaTarget && el.children.length === 0) {
-                                        el.click();
-                                        return true;
-                                    }
-                                }
-                            }
-                            return false;
-                        }""", [mes_txt, dia_txt])
+        precedente_coincidente = None
+        for fila_otra in otras_sentencias:
+            if es_misma_maxima_inter_sentencia(r, fila_otra):
+                precedente_coincidente = fila_otra
+                break
 
-                        enlaces_dia = {}
-                        for _ in range(8):
-                            page.wait_for_timeout(1000)
-                            items_dom = page.evaluate(f"""() => {{
-                                return Array.from(document.querySelectorAll('a[href*="/decisiones/{codigo_sala}/"]')).map(a => {{
-                                    const box = a.closest('tr, li, div');
-                                    return {{ href: a.href, resumen: box ? box.innerText.replace(/\\s+/g, ' ').trim() : a.innerText.trim() }};
-                                }});
-                            }}""")
-                            nuevos = [it for it in items_dom if it["href"] not in hrefs_antes]
-                            if nuevos or (items_dom and not hrefs_antes):
-                                for it in (nuevos if nuevos else items_dom):
-                                    full_url = urljoin("https://historico.tsj.gob.ve", it["href"])
-                                    enlaces_dia[full_url] = {"url": full_url, "sala": sala_nombre, "fecha": f_obj, "resumen": it["resumen"]}
-                                break
+        if precedente_coincidente is not None:
+            # Regla: NO insertar como nueva; actualizar ratificación en la sentencia original
+            p_id, p_num, p_sala, p_fecha, p_tema, p_ext, p_cit, p_ratif = precedente_coincidente
+            nuevas_ratif = actualizar_ratificaciones_ratificada_por(
+                p_ratif, r["numero"], r["fecha"]
+            )
+            cur.execute(
+                "UPDATE sentencias SET ratificaciones = ? WHERE id = ?",
+                (nuevas_ratif, p_id),
+            )
+            print(f"\n      🔗 Criterio preexistente en Sentencia N° {p_num}. Se actualizó ratificación: '{nuevas_ratif}'")
+            upd += 1
+            continue
 
-                        resultados_por_fecha[f_obj].extend(enlaces_dia.values())
-                    except Exception:
-                        pass
+        # ── 3) Es una máxima nueva original: Insertar nuevo registro ──
+        cur.execute(
+            "INSERT INTO sentencias (numero,sala,fecha,tema,extracto,"
+            "contenido_citado,ratificaciones,archivo_origen) VALUES (?,?,?,?,?,?,?,?)",
+            (r["numero"], r["sala"], r["fecha"], r["tema"], r["extracto"],
+             r["contenido_citado"], r["ratificaciones"], archivo_origen),
+        )
+        ins += 1
 
-        browser.close()
-    return resultados_por_fecha, portal_accesible
-
-
-EXTRACTION_PROMPT_WEB = """Actúa como Magistrado Auxiliar experto en Derecho Procesal Penal venezolano.
-Analiza la siguiente sentencia del TSJ y extrae un JSON puro con hasta 3 máximas de nulidad penal.
-
-Criterios:
-- Solo sentencias que decreten nulidades o reposiciones en materia penal.
-- Extrae la redacción propia de la Sala (sin comillas ni citas textuales de otros fallos).
-- Claves exactas por objeto: "numero", "sala", "fecha", "tema", "extracto", "contenido_citado", "ratificaciones".
-
-Devuelve ÚNICAMENTE el JSON puro ([{{...}}]), sin bloques markdown ni texto adicional.
-
-TEXTO DE LA SENTENCIA:
-"""
-
-JSON_ARRAY_RE = re.compile(r"\[.*\]", re.DOTALL)
+    conn.commit()
+    return ins, upd, dup
 
 
-def extraer_maximas_con_ia(client, primary_model, fallback_model, texto_sentencia, meta):
-    prompt = EXTRACTION_PROMPT_WEB.format(sala=meta["sala"], numero_sugerido=meta["numero"], fecha=meta["fecha"], url=meta["url"]) + "\n" + texto_sentencia
-    current_model = primary_model
-    for attempt in range(1, 3):
-        try:
-            response = client.models.generate_content(model=current_model, contents=prompt)
-            raw = (response.text or "").strip()
-            match = JSON_ARRAY_RE.search(raw)
-            if match:
-                data = json.loads(match.group())
-                if isinstance(data, list):
-                    return data[:MAX_MAXIMAS_POR_SENTENCIA], True, ""
-        except Exception as e:
-            if current_model != fallback_model:
-                current_model = fallback_model
-            time.sleep(2 * attempt)
-    return [], False, "Error IA"
+def guardar_estado_bloque(conn, archivo, bloque_idx, total, estado, n=0, err=""):
+    conn.cursor().execute(
+        "INSERT INTO estado_bloques (archivo,bloque_idx,total_bloques,estado,"
+        "sentencias_detectadas,error_detalle,fecha_actualizacion) "
+        "VALUES (?,?,?,?,?,?,datetime('now','localtime')) "
+        "ON CONFLICT(archivo,bloque_idx) DO UPDATE SET "
+        "estado=excluded.estado,sentencias_detectadas=excluded.sentencias_detectadas,"
+        "error_detalle=excluded.error_detalle,fecha_actualizacion=datetime('now','localtime')",
+        (archivo, bloque_idx, total, estado, n, err),
+    )
+    conn.commit()
+
+
+def obtener_bloques_a_procesar(conn, archivo, total, reprocess=False):
+    cur = conn.cursor()
+    cur.execute("SELECT total_bloques FROM estado_bloques WHERE archivo=? LIMIT 1", (archivo,))
+    prev = cur.fetchone()
+    if reprocess or (prev and prev[0] != total):
+        cur.execute("DELETE FROM estado_bloques WHERE archivo=?", (archivo,))
+        conn.commit()
+        return list(range(1, total + 1))
+    cur.execute("SELECT bloque_idx FROM estado_bloques WHERE archivo=? AND estado='EXITOSO'", (archivo,))
+    ok = {r[0] for r in cur.fetchall()}
+    return [i for i in range(1, total + 1) if i not in ok]
 
 
 def count_sentencias(conn):
-    cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*), COUNT(DISTINCT numero || '_' || sala) FROM sentencias")
-    return cursor.fetchone()
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*), COUNT(DISTINCT numero||'_'||sala) FROM sentencias")
+    return c.fetchone()
 
 
 def export_csv(conn):
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, numero, sala, fecha, COALESCE(tema, ''), extracto, contenido_citado, COALESCE(ratificaciones, ''), archivo_origen FROM sentencias ORDER BY id")
+    """Exporta la tabla sentencias a CSV compatible con Excel."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id,numero,sala,fecha,COALESCE(tema,''),extracto,contenido_citado,"
+        "COALESCE(ratificaciones,''),archivo_origen FROM sentencias ORDER BY id"
+    )
+    rows = cur.fetchall()
     with open(CSV_PATH, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.writer(f, delimiter=";")
-        writer.writerow(["ID", "Número", "Sala", "Fecha", "Tema", "Extracto", "Contenido Citado", "Ratificaciones", "Origen"])
-        writer.writerows(cursor.fetchall())
+        w = csv.writer(f, delimiter=";")
+        w.writerow(["ID","Número","Sala","Fecha","Tema / Punto Jurídico",
+                     "Extracto (Resumen)","Contenido Citado (Textual)",
+                     "Ratificaciones / Precedentes","Archivo Origen"])
+        w.writerows(rows)
+    print(f"\n📊 CSV exportado: {CSV_PATH}  ({len(rows)} registros)")
 
 
-def main():
-    print("=" * 65)
-    print("  EXTRACTOR WEB TSJ - EXCLUSIVO SENTENCIAS DE NULIDAD PENAL")
-    print("=" * 65)
-    conn = init_db()
-    fecha_inicio, fecha_fin = obtener_rango_fechas(conn)
-    print(f"🕒 Fecha actual (Venezuela): {fecha_fin.strftime('%d/%m/%Y')}")
-    print(f"📅 Rango de revisión programado: {fecha_inicio.strftime('%d/%m/%Y')} -> {fecha_fin.strftime('%d/%m/%Y')}")
+# ─── Determinación Inteligente de Fechas ─────────────────────────────────────
+def determinar_dias_a_procesar(conn, session, args):
+    """
+    Determina qué fechas se deben procesar según argumentos o seguimiento incremental:
+      - Si se pasa --reset-fecha: borra el registro previo.
+      - Si se pasa --fecha DD/MM/AAAA: procesa únicamente esa fecha.
+      - Si se pasa --mes MM: procesa ese mes completo.
+      - Si se pasa --desde DD/MM/AAAA: procesa desde esa fecha en adelante.
+      - Si se pasa --todas: procesa todo el año publicado.
+      - MODO AUTOMÁTICO (sin argumentos de fecha):
+          * Si nunca se ha extraído: procesa todo OCTUBRE 2026.
+          * Si ya se extrajo antes: consulta el TSJ y procesa SOLO fechas
+            posteriores a la última fecha registrada.
+    """
+    clave_control = f"ultima_fecha_procesada_{SALA_ID}"
 
-    decisiones_por_dia, portal_accesible = buscar_decisiones_en_portal_tsj(fecha_inicio, fecha_fin)
-    if not portal_accesible:
-        print("\n⚠️  El portal del TSJ no respondió. No se modificará la fecha de control.")
-        export_csv(conn)
-        conn.close()
-        return
+    # 1) Manejo de --reset-fecha
+    if "--reset-fecha" in args:
+        conn.cursor().execute("DELETE FROM control_web WHERE clave = ?", (clave_control,))
+        conn.commit()
+        print("🔄 Se ha reiniciado el registro de última fecha procesada.")
 
-    if not any(decisiones_por_dia.values()):
-        print("\nℹ️  No se hallaron sentencias en el rango.")
-        actualizar_ultima_fecha_revisada(conn, fecha_fin)
-        export_csv(conn)
-        conn.close()
-        return
+    print("\n🌐 Consultando calendario de sentencias publicadas en el TSJ...")
+    dias_publicados = obtener_dias_publicados(session, SALA_ID, ANO_DEFAULT)
+    if not dias_publicados:
+        print("⚠  No se pudieron obtener las fechas publicadas desde la API del TSJ.")
+        return []
 
-    client = init_client()
-    primary_model, fallback_model = select_model(client)
+    print(f"📅 El portal del TSJ registra {len(dias_publicados)} días con sentencias en {ANO_DEFAULT} para la {SALA_NOMBRE}.")
 
-    todo_sin_errores = True
-    for dia_actual in sorted(decisiones_por_dia.keys()):
-        items_dia = decisiones_por_dia[dia_actual]
-        if not items_dia:
-            continue
-        print(f"\n📆 Día {dia_actual.strftime('%d/%m/%Y')} ({len(items_dia)} sentencias)")
-        for item in items_dia:
-            url = item["url"]
-            if url_ya_procesada(conn, url):
-                continue
-            texto_completo = descargar_texto_sentencia(url)
-            if not texto_completo or len(texto_completo) < 500:
-                continue
-            es_penal, tiene_nulidad, _ = evaluar_pertinencia_y_nulidad(texto_completo, item.get("resumen", ""), item["sala"])
-            if not es_penal or (FILTRAR_SOLO_CON_INDICADORES_NULIDAD and not tiene_nulidad):
-                guardar_estado_bloque(conn, url, "EXITOSO", 0, "Omitida por filtros")
-                continue
-
-            meta = extraer_metadatos_cabecera(texto_completo, url, item["sala"], dia_actual)
-            meta["url"] = url
-            maximas, exito, err = extraer_maximas_con_ia(client, primary_model, fallback_model, recortar_seccion_relevante(texto_completo), meta)
-            if exito:
-                guardar_estado_bloque(conn, url, "EXITOSO", len(maximas))
-                if maximas:
-                    insert_sentencias(conn, maximas, url)
+    # 2) Argumento explícito: --fecha DD/MM/AAAA
+    if "--fecha" in args:
+        idx = args.index("--fecha")
+        if idx + 1 < len(args):
+            f_target = args[idx + 1].strip()
+            dias = [d for d in dias_publicados if d["fecha"] == f_target]
+            if dias:
+                print(f"🎯 Modo fecha específica: {f_target}")
+                return dias
             else:
-                todo_sin_errores = False
-                guardar_estado_bloque(conn, url, "ERROR", 0, err)
-            time.sleep(2)
+                print(f"⚠ La fecha {f_target} no tiene sentencias registradas en la API del TSJ.")
+                f_dt = parse_fecha(f_target)
+                if f_dt:
+                    return [{"fecha": f_target, "fecha_dt": f_dt, "cuantas": 0, "mes_nombre": "", "mes_num": f_dt.month, "dia": str(f_dt.day)}]
+                return []
 
-    if todo_sin_errores:
-        actualizar_ultima_fecha_revisada(conn, fecha_fin)
+    # 3) Argumento explícito: --mes MM / nombre
+    if "--mes" in args:
+        idx = args.index("--mes")
+        if idx + 1 < len(args):
+            m_arg = args[idx + 1].strip().lower()
+            m_num = MESES_MAP.get(m_arg)
+            if m_num:
+                dias = [d for d in dias_publicados if d["mes_num"] == m_num]
+                print(f"🎯 Modo mes específico: Mes {m_num} ({len(dias)} días encontrados)")
+                return dias
+            else:
+                print(f"⚠ Mes no reconocido: {m_arg}")
+                return []
 
+    # 4) Argumento explícito: --desde DD/MM/AAAA
+    if "--desde" in args:
+        idx = args.index("--desde")
+        if idx + 1 < len(args):
+            d_str = args[idx + 1].strip()
+            d_dt = parse_fecha(d_str)
+            if d_dt:
+                dias = [d for d in dias_publicados if d["fecha_dt"] >= d_dt]
+                print(f"🎯 Modo rango: Desde {d_str} en adelante ({len(dias)} días a procesar)")
+                return dias
+
+    # 5) Argumento explícito: --todas
+    if "--todas" in args or "--todo-el-ano" in args:
+        print(f"🎯 Modo completo: Todas las fechas de {ANO_DEFAULT} ({len(dias_publicados)} días)")
+        return dias_publicados
+
+    # 6) MODO AUTOMÁTICO (por defecto)
+    ultima_fecha_str = obtener_control(conn, clave_control)
+
+    if not ultima_fecha_str:
+        # PRIMERA EJECUCIÓN: Procesar todas las sentencias de Octubre 2026
+        dias_octubre = [d for d in dias_publicados if d["mes_num"] == 10]
+        total_oct = sum(d["cuantas"] for d in dias_octubre)
+        print("\n" + "=" * 60)
+        print("📌 PRIMERA EJECUCIÓN DETECTADA")
+        print(f"   Objetivo inicial: Todas las sentencias de OCTUBRE {ANO_DEFAULT}")
+        print(f"   Días encontrados: {len(dias_octubre)} fechas ({total_oct} sentencias estimadas)")
+        print("=" * 60)
+        for d in dias_octubre:
+            print(f"   • {d['fecha']} ({d['cuantas']} sentencias)")
+        return dias_octubre
+
+    # EJECUCIONES SUBSECUENTES: Revisar fechas posteriores a la última procesada
+    ultima_dt = parse_fecha(ultima_fecha_str)
+    print("\n" + "=" * 60)
+    print("📌 MODO INCREMENTAL INTELIGENTE")
+    print(f"   Última fecha registrada en la base de datos: {ultima_fecha_str}")
+    print(f"   Buscando nuevas fechas publicadas posteriores al {ultima_fecha_str}...")
+    print("=" * 60)
+
+    dias_posteriores = [d for d in dias_publicados if d["fecha_dt"] > ultima_dt]
+
+    if not dias_posteriores:
+        print(f"\n✨ ¡Estás al día! No se encontraron nuevas fechas publicadas después del {ultima_fecha_str}.")
+        return []
+
+    total_nuevas = sum(d["cuantas"] for d in dias_posteriores)
+    print(f"\n🆕 Se encontraron {len(dias_posteriores)} nueva(s) fecha(s) posterior(es) ({total_nuevas} sentencias):")
+    for d in dias_posteriores:
+        print(f"   • {d['fecha']} ({d['cuantas']} sentencias)")
+    return dias_posteriores
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+def main():
+    print("=" * 60)
+    print("  EXTRACTOR WEB DE JURISPRUDENCIA – SALA DE CASACIÓN PENAL")
+    print("  Tribunal Supremo de Justicia de Venezuela")
+    print("  Extracción de Máximas Jurídicas Originales")
+    print("=" * 60)
+
+    args = sys.argv[1:]
+    reprocess_all = "--reprocesar-todo" in args or "--todos" in args
+
+    conn = init_db()
+    session = requests.Session()
+    session.verify = False
+
+    # 1) Determinar días a procesar
+    dias_a_procesar = determinar_dias_a_procesar(conn, session, args)
+
+    if not dias_a_procesar:
+        conn.close()
+        return
+
+    # 2) Inicializar cliente Gemini y seleccionar modelos
+    print("\n🤖 Inicializando conexión con Google Gemini...")
+    client = init_client()
+    print("\n🔍 Verificando modelos disponibles (primario y respaldo)...")
+    primary, fallback = select_model(client)
+    print(f"\n✅ Modelo Primario: {primary}")
+    print(f"🛡️  Modelo de Respaldo: {fallback}")
+
+    # 3) Procesar día a día
+    total_general_ins = 0
+    total_general_upd = 0
+    total_general_dup = 0
+    total_sentencias_procesadas = 0
+
+    clave_control = f"ultima_fecha_procesada_{SALA_ID}"
+
+    for dia_idx, dia_info in enumerate(dias_a_procesar, 1):
+        fecha_str = dia_info["fecha"]
+        print(f"\n{'━' * 60}")
+        print(f"📅 [{dia_idx}/{len(dias_a_procesar)}] PROCESANDO DÍA: {fecha_str}")
+        print(f"   Decisiones esperadas en portal: {dia_info['cuantas']}")
+        print(f"{'━' * 60}")
+
+        sentencias = listar_sentencias_por_fecha(session, fecha_str, SALA_ID)
+        if not sentencias:
+            print(f"   ⚠ No se pudieron descargar las sentencias para {fecha_str}.")
+            continue
+
+        print(f"   📥 Sentencias listadas para este día: {len(sentencias)}")
+
+        hubo_errores_graves_en_dia = False
+
+        for idx, info in enumerate(sentencias, 1):
+            numero = info["numero"]
+            url = info["url"]
+            ponente = info["ponente"]
+            archivo_id = f"TSJ_Web_SCP_{numero}_{fecha_str.replace('/', '-')}"
+
+            print(f"\n  📖 [{idx}/{len(sentencias)}] Sentencia N° {numero} del {fecha_str}")
+            if ponente:
+                print(f"     👤 Ponente: {ponente}")
+            if info.get("procedimiento"):
+                print(f"     📋 Procedimiento: {info['procedimiento']}")
+
+            # 1. Filtro previo por procedimiento: Extradición
+            cat_pre, _, _, _ = clasificar_pauta_decision(info)
+            if cat_pre == "EXTRADICION":
+                print("     🚫 Decisión de Extradición: se omite la extracción según directriz (0 máximas).")
+                guardar_estado_bloque(conn, archivo_id, 1, 1, "EXITOSO", 0, "Omitida: Extradición")
+                total_sentencias_procesadas += 1
+                continue
+
+            # Descargar texto
+            print("     📥 Descargando texto...", end=" ")
+            texto = descargar_texto_sentencia(session, url)
+            if not texto:
+                print("✘ No se pudo descargar")
+                hubo_errores_graves_en_dia = True
+                continue
+            print(f"✔ ({len(texto):,} caracteres)")
+
+            if not ponente:
+                ponente = extraer_ponente_de_texto(texto)
+                if ponente:
+                    print(f"     👤 Ponente detectado: {ponente}")
+
+            # 2. Clasificar tipo de decisión y pauta de máximas
+            categoria, min_m, max_m, instruccion_pauta = clasificar_pauta_decision(info, texto)
+            if categoria == "EXTRADICION":
+                print("     🚫 Decisión de Extradición: se omite la extracción según directriz (0 máximas).")
+                guardar_estado_bloque(conn, archivo_id, 1, 1, "EXITOSO", 0, "Omitida: Extradición")
+                total_sentencias_procesadas += 1
+                continue
+
+            print(f"     ⚖️  Tipo de fallo: {categoria} (Pauta: {min_m} a {max_m} máximas)")
+
+            # Aislar el capítulo decisorio previo a la DECISIÓN / DISPOSITIVO
+            texto_decisorio, nombre_cap = aislar_capitulo_decisorio(texto)
+            print(f"     🎯 Capítulo decisorio: '{nombre_cap}' ({len(texto_decisorio):,} de {len(texto):,} caracteres)")
+
+            chunks = chunk_text(texto_decisorio)
+            total_chunks = len(chunks)
+            pendientes = obtener_bloques_a_procesar(conn, archivo_id, total_chunks, reprocess_all)
+
+            print(f"     📄 Bloques: {total_chunks} total, {len(pendientes)} pendiente(s)")
+
+            if not pendientes:
+                print("     ✨ Esta sentencia ya estaba procesada exitosamente.")
+                total_sentencias_procesadas += 1
+                continue
+
+            maximas_sentencia = []
+            bloques_error = []
+            for count, c_num in enumerate(pendientes, 1):
+                # Verificar si ya se alcanzó el tope para esta decisión (ej: máx 1 para inadmisible/desestimado)
+                if max_m > 0 and len(maximas_sentencia) >= max_m:
+                    print(f"     ⏩ Cuota alcanzada ({len(maximas_sentencia)}/{max_m} máximas). Omitiendo bloque {c_num}.")
+                    guardar_estado_bloque(conn, archivo_id, c_num, total_chunks, "EXITOSO", 0, "Cuota alcanzada")
+                    continue
+
+                chunk = chunks[c_num - 1]
+                print(f"     🔄 [{count}/{len(pendientes)}] Analizando bloque {c_num}/{total_chunks}...", end=" ")
+
+                cupo_disponible = max_m - len(maximas_sentencia) if max_m > 0 else 0
+                maximas, ok, err = extract_maximas(
+                    client, primary, fallback, chunk, numero, fecha_str, ponente,
+                    instruccion_pauta=instruccion_pauta, max_permitidas=cupo_disponible,
+                )
+
+                if ok:
+                    guardar_estado_bloque(conn, archivo_id, c_num, total_chunks, "EXITOSO", len(maximas))
+                    print(f"✔ ({len(maximas)} máximas)")
+                    if maximas:
+                        for m in maximas:
+                            m["numero"] = numero
+                        i, u, d = insert_maximas(conn, maximas, archivo_id)
+                        total_general_ins += i
+                        total_general_upd += u
+                        total_general_dup += d
+                        maximas_sentencia.extend(maximas)
+                else:
+                    guardar_estado_bloque(conn, archivo_id, c_num, total_chunks, "ERROR", 0, err)
+                    bloques_error.append(c_num)
+                    print(f"✘ {err[:60]}...")
+
+                time.sleep(2)
+
+            # Pase de recuperación para bloques con error
+            if bloques_error and (max_m == 0 or len(maximas_sentencia) < max_m):
+                print(f"\n     ⚠️  {len(bloques_error)} bloque(s) con error. Iniciando recuperación...")
+                time.sleep(6)
+                for r in list(bloques_error):
+                    if max_m > 0 and len(maximas_sentencia) >= max_m:
+                        break
+                    print(f"     🔁 Reintentando bloque {r}...", end=" ")
+                    cupo_disponible = max_m - len(maximas_sentencia) if max_m > 0 else 0
+                    maximas, ok, err = extract_maximas(
+                        client, fallback, primary, chunks[r - 1], numero, fecha_str, ponente,
+                        instruccion_pauta=instruccion_pauta, max_permitidas=cupo_disponible,
+                        max_retries=5,
+                    )
+                    if ok:
+                        guardar_estado_bloque(conn, archivo_id, r, total_chunks, "EXITOSO", len(maximas))
+                        print(f"✔ RECUPERADO ({len(maximas)} máximas)")
+                        bloques_error.remove(r)
+                        if maximas:
+                            for m in maximas:
+                                m["numero"] = numero
+                            i, u, d = insert_maximas(conn, maximas, archivo_id)
+                            total_general_ins += i
+                            total_general_upd += u
+                            total_general_dup += d
+                            maximas_sentencia.extend(maximas)
+                    else:
+                        guardar_estado_bloque(conn, archivo_id, r, total_chunks, "ERROR", 0, err)
+                        print("✘ Fallido.")
+                        hubo_errores_graves_en_dia = True
+                    time.sleep(3)
+
+            total_sentencias_procesadas += 1
+
+        # Al completar el día, actualizar la última fecha procesada
+        ultima_guardada = obtener_control(conn, clave_control)
+        ultima_guardada_dt = parse_fecha(ultima_guardada) if ultima_guardada else None
+        fecha_actual_dt = dia_info["fecha_dt"]
+
+        if not ultima_guardada_dt or fecha_actual_dt > ultima_guardada_dt:
+            guardar_control(conn, clave_control, fecha_str)
+            print(f"\n  📌 Control actualizado: última fecha registrada = {fecha_str}")
+
+    # 4) Resumen final
     total_ext, sent_unicas = count_sentencias(conn)
+    print(f"\n{'=' * 60}")
+    print("  RESUMEN DE EJECUCIÓN WEB")
+    print(f"{'=' * 60}")
+    print(f"  📅 Días procesados:            {len(dias_a_procesar)}")
+    print(f"  📄 Sentencias analizadas:      {total_sentencias_procesadas}")
+    print(f"  ✅ Máximas nuevas añadidas:    {total_general_ins}")
+    print(f"  📝 Máximas enriquecidas:       {total_general_upd}")
+    print(f"  🔄 Duplicadas sin cambios:     {total_general_dup}")
+    print(f"  📋 Total extractos en BD:      {total_ext}")
+    print(f"  ⚖️  Sentencias únicas en BD:    {sent_unicas}")
+    print(f"  🗄  Base de datos:              {DB_PATH}")
+
+    # 5) Exportar CSV
     export_csv(conn)
     conn.close()
-    print(f"\n✨ Ejecución finalizada. Total en BD: {total_ext} extractos ({sent_unicas} sentencias únicas).")
+    print(f"\n✅ Proceso finalizado.")
 
 
 if __name__ == "__main__":
