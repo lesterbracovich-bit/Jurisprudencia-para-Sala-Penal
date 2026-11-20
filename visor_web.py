@@ -225,10 +225,21 @@ def main():
         sala_seleccionada = st.selectbox("Seleccione la Sala:", opciones_sala)
 
         # Filtro por Texto / Palabras Clave
-        busqueda = st.text_input(
+        busqueda_lateral = st.text_input(
             "Buscar en extractos o citas:",
-            placeholder="Ej: casación, sobreseimiento, acusación...",
-            help="Busca coincidencias en el resumen jurídico, la cita textual o el número de sentencia.",
+            placeholder="Ej: casación, acusación, 433...",
+            help="Busca coincidencias en el tema, resumen jurídico, cita textual o número de sentencia.",
+        )
+
+        st.divider()
+
+        # Selector de Límite de Visualización
+        st.subheader("📑 Visualización")
+        limite_opcion = st.selectbox(
+            "Criterios en pantalla:",
+            options=[20, 50, 100, "Todos"],
+            index=0,
+            help="Por defecto se muestran los últimos 20 criterios para maximizar la velocidad y ligereza de la página.",
         )
 
         # ─── Aplicación Inmediata de Filtros ─────────────────────────────────
@@ -238,9 +249,9 @@ def main():
         if sala_seleccionada != "Todas las Salas":
             df_filtrado = df_filtrado[df_filtrado["sala"] == sala_seleccionada]
 
-        # Filtro por palabra clave
-        if busqueda.strip():
-            termino = busqueda.strip().lower()
+        # Filtro por palabra clave (barra lateral)
+        if busqueda_lateral.strip():
+            termino = busqueda_lateral.strip().lower()
             condicion = (
                 df_filtrado["tema"].str.lower().str.contains(termino, na=False)
                 | df_filtrado["extracto"].str.lower().str.contains(termino, na=False)
@@ -251,13 +262,13 @@ def main():
             df_filtrado = df_filtrado[condicion]
 
         # ─── Panel de Resultados en la Barra Lateral ──────────────────────────
-        hay_filtro = bool(busqueda.strip()) or (sala_seleccionada != "Todas las Salas")
+        hay_filtro = bool(busqueda_lateral.strip()) or (sala_seleccionada != "Todas las Salas")
         cant_hallazgos = len(df_filtrado)
 
         if hay_filtro:
             if cant_hallazgos > 0:
                 st.success(f"🎯 **{cant_hallazgos}** resultado(s) hallado(s)")
-                with st.expander(f"📋 Lista rápida ({cant_hallazgos})", expanded=True):
+                with st.expander(f"📋 Lista rápida ({cant_hallazgos})", expanded=False):
                     for _, r in df_filtrado.iterrows():
                         num = r["numero"]
                         s_corta = "Penal" if "Penal" in r["sala"] else ("Const." if "Const" in r["sala"] else r["sala"][:12])
@@ -266,7 +277,7 @@ def main():
             else:
                 st.error("❌ No se hallaron resultados para esta búsqueda.")
         else:
-            st.caption(f"ℹ️ Mostrando los {cant_hallazgos} extractos registrados.")
+            st.caption(f"ℹ️ Base de datos: {len(df)} extractos registrados.")
 
         st.divider()
 
@@ -300,10 +311,50 @@ def main():
             unsafe_allow_html=True,
         )
 
+    # ─── Buscador Rápido Principal ───────────────────────────────────────────
+    busqueda_principal = st.text_input(
+        "🔍 Buscar jurisprudencia (tema, palabra clave, expediente o N° de sentencia):",
+        value=busqueda_lateral,
+        placeholder="Ej: casación, inmotivación, dosimetría, 433, acusación, sobreseimiento...",
+        help="Filtra en tiempo real sobre el tema jurídico, el criterio/resumen o la cita textual.",
+    )
+
+    # Si se escribió en la barra principal y es diferente al lateral, aplicar filtro
+    if busqueda_principal.strip() and busqueda_principal.strip() != busqueda_lateral.strip():
+        termino = busqueda_principal.strip().lower()
+        condicion = (
+            df_filtrado["tema"].str.lower().str.contains(termino, na=False)
+            | df_filtrado["extracto"].str.lower().str.contains(termino, na=False)
+            | df_filtrado["contenido_citado"].str.lower().str.contains(termino, na=False)
+            | df_filtrado["ratificaciones"].str.lower().str.contains(termino, na=False)
+            | df_filtrado["numero"].astype(str).str.lower().str.contains(termino, na=False)
+        )
+        df_filtrado = df_filtrado[condicion]
+        hay_filtro = True
+        cant_hallazgos = len(df_filtrado)
+
+    # ─── Aplicación del Límite de Visualización ──────────────────────────────
+    if limite_opcion == "Todos":
+        df_mostrar = df_filtrado
+    else:
+        df_mostrar = df_filtrado.head(int(limite_opcion))
+
     # ─── Barra informativa de resultados (Cabecera principal) ─────────────────
     col_info, col_export = st.columns([3, 1])
     with col_info:
-        st.markdown(f"**Resultados encontrados:** `{len(df_filtrado)}` extracto(s)")
+        if not hay_filtro:
+            st.info(
+                f"📌 **Mostrando los {len(df_mostrar)} criterios más recientes** *(de {len(df)} totales)* para una carga ultrarrápida. "
+                f"Usa el buscador para consultar cualquier criterio o tema del histórico completo."
+            )
+        else:
+            if len(df_mostrar) < cant_hallazgos:
+                st.markdown(
+                    f"🎯 **{cant_hallazgos}** resultado(s) encontrados. "
+                    f"Mostrando los primeros **{len(df_mostrar)}** *(puedes ampliar la cantidad en la barra lateral)*."
+                )
+            else:
+                st.markdown(f"🎯 **{cant_hallazgos}** resultado(s) encontrados para tu búsqueda.")
     with col_export:
         csv_data = df_filtrado.to_csv(index=False, sep=";", encoding="utf-8-sig")
         st.download_button(
@@ -316,11 +367,11 @@ def main():
     st.write("")
 
     # ─── Renderizado de Tarjetas de Sentencias ────────────────────────────────
-    if df_filtrado.empty:
-        st.info("No se encontraron sentencias con los criterios seleccionados.")
+    if df_mostrar.empty:
+        st.warning("🔍 No se encontraron sentencias con los criterios de búsqueda seleccionados.")
         return
 
-    for _, row in df_filtrado.iterrows():
+    for _, row in df_mostrar.iterrows():
         numero = row["numero"]
         sala = row["sala"]
         fecha = row["fecha"]
