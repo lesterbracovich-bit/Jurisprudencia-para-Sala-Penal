@@ -65,12 +65,20 @@ CSV_PATH = os.path.join(BASE_DIR, "reporte_jurisprudencia.csv")
 
 API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 
+class LimiteDiarioExcedidoError(Exception):
+    """Excepción lanzada cuando se agota la cuota diaria (RPD) de la API de Gemini."""
+    pass
+
+
 # Modelos Gemini en orden de preferencia (disponibles en AI Studio)
 PREFERRED_MODELS = [
-    "gemini-4-hydrogen",     # Eficiente, rápido y verificado disponible
-    "gemini-3.6-flash",      # Respaldo confiable
+    "gemini-3.8-flash",      # Modelo principal (rápido, ágil y de alta cuota)
+    "gemini-4-hydrogen",     # Modelo de respaldo (alta capacidad de análisis y precisión)
+    "gemini-3.6-flash",      # Respaldo confiable adicional
     "gemini-3.5-flash-lite", # Respaldo liviano
-    "gemini-3.8-flash",      # Disponible en AI Studio
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
     "gemini-4-argon",
     "gemini-4-neon",
 ]
@@ -420,47 +428,99 @@ def aislar_capitulo_decisorio(texto):
         # No se pudo ubicar el capítulo final con certeza
         return texto, "TEXTO_COMPLETO"
 
-    # 2. Localizar el inicio del capítulo inmediatamente anterior
+    # 2. Localizar el inicio del capítulo inmediatamente anterior (Ratio Decidendi de la Sala)
     # Se busca hacia atrás desde idx_final
+    PATRON_TITULO = re.compile(
+        r"^(?:[IVXLCDM]+\s*[-.:]\s*)?"
+        r"(?:"
+        r"CONSIDERACIONES(?:\s+PARA\s+DECIDIR|\s+DE\s+LA\s+SALA|\s+PREVIAS)?"
+        r"|MOTIVACI[OÓ]N(?:\s+PARA\s+DECIDIR)?"
+        r"|MOTIVOS?\s+PARA\s+DECIDIR"
+        r"|FUNDAMENTOS?\s+PARA\s+DECIDIR"
+        r"|FUNDAMENTOS?\s+DE\s+LA\s+SALA"
+        r"|DE\s+LA\s+FUNDAMENTACI[OÓ]N(?:\s+DEL\s+RECURSO)?"
+        r"|(?:DE\s+LA|SOBRE\s+LA)\s+ADMISIBILIDAD"
+        r"|(?:DE\s+LA|SOBRE\s+LA)\s+PROCEDENCIA(?:\s+DEL\s+AVOCAMIENTO)?"
+        r"|NULIDAD(?:\s+DE\s+OFICIO)?"
+        r"|DEL\s+FONDO(?:\s+DEL\s+ASUNTO|\s+DE\s+LA\s+CONTROVERSIA)?"
+        r"|JUICIO\s+DE\s+LA\s+SALA"
+        r"|CRITERIO\s+DE\s+LA\s+SALA"
+        r")$",
+        re.IGNORECASE
+    )
+
+    RE_EXCLUIR = re.compile(
+        r"(?:SOLICITUD|RECURRENTE|SOLICITANTE|DEFENSA|QUERELLA|ACUSACI[OÓ]N|DENUNCIA|ANTECEDENTES|HECHOS|COMPETENCIA)",
+        re.IGNORECASE
+    )
+
     idx_inicio = -1
     titulo = ""
 
+    # Estrategia 1: Buscar hacia atrás un encabezado temático explícito del análisis de la Sala
     for i in range(idx_final - 1, 0, -1):
         l = lines[i]
-        if len(l) > 90:
+        if len(l) > 80:
             continue
-        # Excluir menciones de cédulas venezolanas tipo "V- 12.345.678"
         if re.match(r"^V\s*-\s*\d+", l, re.IGNORECASE):
             continue
 
-        l_u = l.upper()
+        sig = lines[i + 1] if i + 1 < idx_final and len(lines[i + 1]) < 60 else ""
+        combinada = f"{l} {sig}".strip()
 
-        # Caso A: Número romano solo en su línea (ej: "VI", "V", "IV", "III")
+        # Si l es un número romano solo (ej: "VI") y la siguiente es el título
         if re.match(r"^[IVXLCDM]+$", l):
-            sig = lines[i + 1] if i + 1 < idx_final else ""
-            idx_inicio = i
-            titulo = f"{l} - {sig}" if sig and len(sig) < 80 else l
-            break
+            if PATRON_TITULO.match(sig) and not RE_EXCLUIR.search(sig):
+                idx_inicio = i
+                titulo = f"{l} - {sig}"
+                break
+            sig2 = f"{sig} {lines[i + 2]}".strip() if i + 2 < idx_final and len(lines[i + 2]) < 60 else ""
+            if PATRON_TITULO.match(sig2) and not RE_EXCLUIR.search(sig2):
+                idx_inicio = i
+                titulo = f"{l} - {sig2}"
+                break
 
-        # Caso B: Número romano con título en la misma línea (ej: "VI. CONSIDERACIONES PARA DECIDIR")
-        if re.match(r"^[IVXLCDM]+\s*[-.:]\s*.+$", l):
+        # Título directo en una línea o combinado en 2 líneas
+        if PATRON_TITULO.match(combinada) and not RE_EXCLUIR.search(combinada):
             idx_inicio = i
-            titulo = l
-            break
-
-        # Caso C: Título temático estándar en mayúsculas sin número romano
-        if any(l_u.startswith(k) for k in [
-            "CONSIDERACIONES PARA DECIDIR", "CONSIDERACIONES DE LA SALA",
-            "MOTIVACIÓN PARA DECIDIR", "DE LA ADMISIBILIDAD",
-            "DE LA FUNDAMENTACIÓN", "DE LA PROCEDENCIA",
-            "ESTA SALA OBSERVA", "ESTA SALA CONSIDERA"
-        ]):
-            idx_inicio = i
-            titulo = l
+            titulo = combinada
             if i > 0 and re.match(r"^[IVXLCDM]+$", lines[i - 1]):
                 idx_inicio = i - 1
-                titulo = f"{lines[i - 1]} - {l}"
+                titulo = f"{lines[i - 1]} - {combinada}"
             break
+        elif PATRON_TITULO.match(l) and not RE_EXCLUIR.search(l):
+            idx_inicio = i
+            titulo = f"{l} {sig}" if sig and any(sig.upper().startswith(x) for x in ["PARA DECIDIR", "DE LA SALA", "PREVIAS", "DE OFICIO"]) else l
+            if i > 0 and re.match(r"^[IVXLCDM]+$", lines[i - 1]):
+                idx_inicio = i - 1
+                titulo = f"{lines[i - 1]} - {titulo}"
+            break
+
+    # Estrategia 2: Si no hubo coincidencia temática explícita, buscar el número romano inmediatamente anterior
+    if idx_inicio == -1:
+        for i in range(idx_final - 1, 0, -1):
+            l = lines[i]
+            if len(l) > 80:
+                continue
+            if re.match(r"^V\s*-\s*\d+", l, re.IGNORECASE):
+                continue
+
+            # Romano solo
+            if re.match(r"^[IVXLCDM]+$", l):
+                sig = lines[i + 1] if i + 1 < idx_final and len(lines[i + 1]) < 80 else ""
+                if not RE_EXCLUIR.search(sig):
+                    idx_inicio = i
+                    titulo = f"{l} - {sig}" if sig else l
+                    break
+
+            # Romano con título
+            m_romano = re.match(r"^([IVXLCDM]+)\s*[-.:]\s*(.+)$", l)
+            if m_romano:
+                tit_posible = m_romano.group(2)
+                if not RE_EXCLUIR.search(tit_posible):
+                    idx_inicio = i
+                    titulo = l
+                    break
 
     # 3. Validar y construir el texto aislado
     if idx_inicio != -1 and idx_inicio < idx_final:
@@ -701,6 +761,26 @@ def extract_maximas(client, primary_model, fallback_model, text_chunk,
         except Exception as e:
             error_msg = str(e)
             last_error = error_msg
+
+            # Detección de límite diario alcanzado (Free Tier RPD)
+            is_daily_limit = any(
+                k in error_msg.lower()
+                for k in [
+                    "limit: 20",
+                    "generate content requests per day limit exceeded",
+                    "free_tier_requests",
+                    "per day limit exceeded",
+                ]
+            )
+            if is_daily_limit:
+                if fallback_model and current_model != fallback_model:
+                    print(f"\n    ⚠️ {current_model} límite diario alcanzado → probando {fallback_model}...", end=" ")
+                    current_model = fallback_model
+                    time.sleep(2)
+                    continue
+                else:
+                    raise LimiteDiarioExcedidoError(f"Cuota diaria agotada en Gemini API (Free Tier): {error_msg}")
+
             is_busy = any(
                 k in error_msg
                 for k in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"]
@@ -1221,41 +1301,83 @@ def determinar_dias_a_procesar(conn, session, args):
         print(f"🎯 Modo completo: Todas las fechas de {ANO_DEFAULT} ({len(dias_publicados)} días)")
         return dias_publicados
 
-    # 6) MODO AUTOMÁTICO (por defecto)
+    # 6) MODO AUTOMÁTICO (por defecto) con Autorrecuperación Inteligente
     ultima_fecha_str = obtener_control(conn, clave_control)
 
+    # Identificar fechas con bloques o sentencias pendientes por error en estado_bloques
+    c = conn.cursor()
+    c.execute("SELECT DISTINCT archivo FROM estado_bloques WHERE estado = 'ERROR'")
+    archivos_error = [r[0] for r in c.fetchall()]
+    fechas_con_error = set()
+    for arch in archivos_error:
+        m = re.search(r"(\d{2})[-/](\d{2})[-/](\d{4})", arch)
+        if m:
+            fechas_con_error.add(f"{m.group(1)}/{m.group(2)}/{m.group(3)}")
+
+    # Detectar fechas que quedaron incompletas (menos sentencias completadas que publicadas)
+    c.execute("""
+        SELECT archivo, min(estado)
+        FROM estado_bloques
+        GROUP BY archivo
+    """)
+    completadas_por_fecha = {}
+    for arch, min_est in c.fetchall():
+        if min_est == "EXITOSO":
+            m = re.search(r"(\d{2})[-/](\d{2})[-/](\d{4})", arch)
+            if m:
+                f = f"{m.group(1)}/{m.group(2)}/{m.group(3)}"
+                completadas_por_fecha[f] = completadas_por_fecha.get(f, 0) + 1
+
+    dias_a_procesar_dict = {}
+
+    # A. Fechas con errores activos que deben reintentarse prioritariamente
+    for d in dias_publicados:
+        f = d["fecha"]
+        if f in fechas_con_error:
+            dias_a_procesar_dict[f] = d
+
+    # B. Fechas nuevas o iniciales
     if not ultima_fecha_str:
         # PRIMERA EJECUCIÓN: Procesar todas las sentencias de Octubre 2026
         dias_octubre = [d for d in dias_publicados if d["mes_num"] == 10]
-        total_oct = sum(d["cuantas"] for d in dias_octubre)
+        for d in dias_octubre:
+            dias_a_procesar_dict[d["fecha"]] = d
         print("\n" + "=" * 60)
         print("📌 PRIMERA EJECUCIÓN DETECTADA")
         print(f"   Objetivo inicial: Todas las sentencias de OCTUBRE {ANO_DEFAULT}")
-        print(f"   Días encontrados: {len(dias_octubre)} fechas ({total_oct} sentencias estimadas)")
+        print(f"   Días encontrados: {len(dias_a_procesar_dict)} fechas")
         print("=" * 60)
-        for d in dias_octubre:
-            print(f"   • {d['fecha']} ({d['cuantas']} sentencias)")
-        return dias_octubre
+    else:
+        ultima_dt = parse_fecha(ultima_fecha_str)
+        for d in dias_publicados:
+            f = d["fecha"]
+            # Días posteriores a la última procesada
+            if d["fecha_dt"] > ultima_dt:
+                dias_a_procesar_dict[f] = d
+            # O el mismo día si quedó incompleto
+            elif d["fecha_dt"] == ultima_dt and f in completadas_por_fecha and completadas_por_fecha[f] < d.get("cuantas", 0):
+                dias_a_procesar_dict[f] = d
 
-    # EJECUCIONES SUBSECUENTES: Revisar fechas posteriores a la última procesada
-    ultima_dt = parse_fecha(ultima_fecha_str)
-    print("\n" + "=" * 60)
-    print("📌 MODO INCREMENTAL INTELIGENTE")
-    print(f"   Última fecha registrada en la base de datos: {ultima_fecha_str}")
-    print(f"   Buscando nuevas fechas publicadas posteriores al {ultima_fecha_str}...")
-    print("=" * 60)
+        print("\n" + "=" * 60)
+        print("📌 MODO INCREMENTAL INTELIGENTE CON AUTORRECUPERACIÓN")
+        print(f"   Última fecha completada registrada en BD: {ultima_fecha_str}")
+        if fechas_con_error:
+            print(f"   🔄 Días con sentencias pendientes por reintentar: {', '.join(sorted(fechas_con_error))}")
+        print("=" * 60)
 
-    dias_posteriores = [d for d in dias_publicados if d["fecha_dt"] > ultima_dt]
+    # Ordenar cronológicamente
+    dias_finales = sorted(dias_a_procesar_dict.values(), key=lambda x: x["fecha_dt"])
 
-    if not dias_posteriores:
-        print(f"\n✨ ¡Estás al día! No se encontraron nuevas fechas publicadas después del {ultima_fecha_str}.")
+    if not dias_finales:
+        print(f"\n✨ ¡Estás al día! No se encontraron fechas pendientes ni nuevas publicaciones posteriores al {ultima_fecha_str}.")
         return []
 
-    total_nuevas = sum(d["cuantas"] for d in dias_posteriores)
-    print(f"\n🆕 Se encontraron {len(dias_posteriores)} nueva(s) fecha(s) posterior(es) ({total_nuevas} sentencias):")
-    for d in dias_posteriores:
-        print(f"   • {d['fecha']} ({d['cuantas']} sentencias)")
-    return dias_posteriores
+    print(f"\n📋 Días a procesar en esta ejecución ({len(dias_finales)} fecha(s)):")
+    for d in dias_finales:
+        extra_info = " (🔄 reintentando pendientes)" if (d["fecha"] in fechas_con_error or (d["fecha"] in completadas_por_fecha and completadas_por_fecha[d["fecha"]] < d.get("cuantas", 0))) else " (🆕 nueva fecha)"
+        print(f"   • {d['fecha']} ({d['cuantas']} sentencias){extra_info}")
+
+    return dias_finales
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -1295,8 +1417,12 @@ def main():
     total_sentencias_procesadas = 0
 
     clave_control = f"ultima_fecha_procesada_{SALA_ID}"
+    limite_diario_alcanzado = False
 
     for dia_idx, dia_info in enumerate(dias_a_procesar, 1):
+        if limite_diario_alcanzado:
+            break
+
         fecha_str = dia_info["fecha"]
         print(f"\n{'━' * 60}")
         print(f"📅 [{dia_idx}/{len(dias_a_procesar)}] PROCESANDO DÍA: {fecha_str}")
@@ -1313,6 +1439,8 @@ def main():
         hubo_errores_graves_en_dia = False
 
         for idx, info in enumerate(sentencias, 1):
+            if limite_diario_alcanzado:
+                break
             numero = info["numero"]
             url = info["url"]
             ponente = info["ponente"]
@@ -1384,10 +1512,17 @@ def main():
                 print(f"     🔄 [{count}/{len(pendientes)}] Analizando bloque {c_num}/{total_chunks}...", end=" ")
 
                 cupo_disponible = max_m - len(maximas_sentencia) if max_m > 0 else 0
-                maximas, ok, err = extract_maximas(
-                    client, primary, fallback, chunk, numero, fecha_str, ponente,
-                    instruccion_pauta=instruccion_pauta, max_permitidas=cupo_disponible,
-                )
+                try:
+                    maximas, ok, err = extract_maximas(
+                        client, primary, fallback, chunk, numero, fecha_str, ponente,
+                        instruccion_pauta=instruccion_pauta, max_permitidas=cupo_disponible,
+                    )
+                except LimiteDiarioExcedidoError as e:
+                    print(f"\n     🛑 {e}")
+                    limite_diario_alcanzado = True
+                    hubo_errores_graves_en_dia = True
+                    guardar_estado_bloque(conn, archivo_id, c_num, total_chunks, "ERROR", 0, str(e))
+                    break
 
                 if ok:
                     guardar_estado_bloque(conn, archivo_id, c_num, total_chunks, "EXITOSO", len(maximas))
@@ -1407,6 +1542,10 @@ def main():
 
                 time.sleep(2)
 
+            if limite_diario_alcanzado:
+                total_sentencias_procesadas += 1
+                break
+
             # Pase de recuperación para bloques con error
             if bloques_error and (max_m == 0 or len(maximas_sentencia) < max_m):
                 print(f"\n     ⚠️  {len(bloques_error)} bloque(s) con error. Iniciando recuperación...")
@@ -1416,11 +1555,19 @@ def main():
                         break
                     print(f"     🔁 Reintentando bloque {r}...", end=" ")
                     cupo_disponible = max_m - len(maximas_sentencia) if max_m > 0 else 0
-                    maximas, ok, err = extract_maximas(
-                        client, fallback, primary, chunks[r - 1], numero, fecha_str, ponente,
-                        instruccion_pauta=instruccion_pauta, max_permitidas=cupo_disponible,
-                        max_retries=5,
-                    )
+                    try:
+                        maximas, ok, err = extract_maximas(
+                            client, fallback, primary, chunks[r - 1], numero, fecha_str, ponente,
+                            instruccion_pauta=instruccion_pauta, max_permitidas=cupo_disponible,
+                            max_retries=5,
+                        )
+                    except LimiteDiarioExcedidoError as e:
+                        print(f"\n     🛑 {e}")
+                        limite_diario_alcanzado = True
+                        hubo_errores_graves_en_dia = True
+                        guardar_estado_bloque(conn, archivo_id, r, total_chunks, "ERROR", 0, str(e))
+                        break
+
                     if ok:
                         guardar_estado_bloque(conn, archivo_id, r, total_chunks, "EXITOSO", len(maximas))
                         print(f"✔ RECUPERADO ({len(maximas)} máximas)")
@@ -1441,14 +1588,36 @@ def main():
 
             total_sentencias_procesadas += 1
 
-        # Al completar el día, actualizar la última fecha procesada
-        ultima_guardada = obtener_control(conn, clave_control)
-        ultima_guardada_dt = parse_fecha(ultima_guardada) if ultima_guardada else None
-        fecha_actual_dt = dia_info["fecha_dt"]
+        # Al completar el día, verificar si quedan errores pendientes en este día
+        fecha_sufijo_guion = fecha_str.replace("/", "-")
+        c = conn.cursor()
+        c.execute(
+            "SELECT count(*) FROM estado_bloques WHERE (archivo LIKE ? OR archivo LIKE ?) AND estado = 'ERROR'",
+            (f"%{fecha_str}%", f"%{fecha_sufijo_guion}%")
+        )
+        errores_restantes = c.fetchone()[0]
 
-        if not ultima_guardada_dt or fecha_actual_dt > ultima_guardada_dt:
-            guardar_control(conn, clave_control, fecha_str)
-            print(f"\n  📌 Control actualizado: última fecha registrada = {fecha_str}")
+        if errores_restantes == 0 and not hubo_errores_graves_en_dia and not limite_diario_alcanzado:
+            ultima_guardada = obtener_control(conn, clave_control)
+            ultima_guardada_dt = parse_fecha(ultima_guardada) if ultima_guardada else None
+            fecha_actual_dt = dia_info["fecha_dt"]
+
+            if not ultima_guardada_dt or fecha_actual_dt > ultima_guardada_dt:
+                guardar_control(conn, clave_control, fecha_str)
+                print(f"\n  📌 Control actualizado: última fecha registrada = {fecha_str}")
+        else:
+            print(f"\n  ⚠️  El día {fecha_str} tiene {errores_restantes} bloque(s) con error no resueltos.")
+            print("     El control de fecha NO avanza para asegurar su revisión en la próxima ejecución.")
+
+    if limite_diario_alcanzado:
+        print("\n" + "=" * 60)
+        print("🛑 LÍMITE DIARIO DE LA API DE GEMINI ALCANZADO (ERROR 429)")
+        print("   Se alcanzó el tope de peticiones del plan Free Tier por el día de hoy.")
+        print("   Todas las máximas y sentencias procesadas con éxito están aseguradas en la BD.")
+        print("   Las sentencias restantes quedaron registradas y se retomarán automáticamente")
+        print("   en la próxima ejecución programada (a las 7:00 PM).")
+        print("=" * 60)
+        conn.commit()
 
     # 4) Resumen final
     total_ext, sent_unicas = count_sentencias(conn)
