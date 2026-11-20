@@ -24,7 +24,14 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           PYTHONIOENCODING: utf-8
         run: |
-          python -u extractor_web.py
+          if exist "C:\Users\Usuario\AppData\Local\Python\pythoncore-3.15-64\python.exe" (
+            set "PY=C:\Users\Usuario\AppData\Local\Python\pythoncore-3.15-64\python.exe"
+          ) else if exist "C:\Users\Usuario\AppData\Local\Programs\Python\Python311\python.exe" (
+            set "PY=C:\Users\Usuario\AppData\Local\Programs\Python\Python311\python.exe"
+          ) else (
+            set "PY=python"
+          )
+          "%PY%" -u extractor_web.py
 
       - name: 3. Guardar cambios en GitHub
         shell: cmd
