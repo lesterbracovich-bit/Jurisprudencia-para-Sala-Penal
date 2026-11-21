@@ -153,7 +153,7 @@ def init_client():
         print("   o definirla en el entorno antes de ejecutar.")
         print("=" * 60)
         sys.exit(1)
-    return genai.Client(api_key=key)
+    return genai.Client(api_key=key, http_options={"timeout": 180000})
 
 
 def select_model(client):
@@ -164,23 +164,23 @@ def select_model(client):
     funcionales = []
     for model_name in PREFERRED_MODELS:
         try:
-            print(f"  Probando modelo: {model_name} ...", end=" ")
+            print(f"  Probando modelo: {model_name} ...", end=" ", flush=True)
             response = client.models.generate_content(
                 model=model_name, contents="Responde solo: OK",
             )
             if response and response.text:
-                print("✔ disponible")
+                print("✔ disponible", flush=True)
                 funcionales.append(model_name)
                 if len(funcionales) >= 2:
                     break
         except Exception as e:
-            print(f"✘ ({type(e).__name__})")
+            print(f"✘ ({type(e).__name__})", flush=True)
 
     if funcionales:
         return funcionales[0], funcionales[1] if len(funcionales) > 1 else funcionales[0]
 
     # Búsqueda dinámica si ninguno preferido funcionó
-    print("\n  Buscando modelos dinámicamente en la cuenta...")
+    print("\n  Buscando modelos dinámicamente en la cuenta...", flush=True)
     try:
         for m in client.models.list():
             name = m.name
@@ -188,15 +188,15 @@ def select_model(client):
                 continue
             short = name.replace("models/", "")
             try:
-                print(f"  Probando: {short} ...", end=" ")
+                print(f"  Probando: {short} ...", end=" ", flush=True)
                 resp = client.models.generate_content(model=short, contents="Responde solo: OK")
                 if resp and resp.text:
-                    print("✔ disponible")
+                    print("✔ disponible", flush=True)
                     return short, short
             except Exception:
-                print("✘")
+                print("✘", flush=True)
     except Exception as e:
-        print(f"  Error al listar modelos: {e}")
+        print(f"  Error al listar modelos: {e}", flush=True)
 
     print("\n❌ No se encontró ningún modelo Gemini disponible.")
     sys.exit(1)
@@ -774,7 +774,7 @@ def extract_maximas(client, primary_model, fallback_model, text_chunk,
             )
             if is_daily_limit:
                 if fallback_model and current_model != fallback_model:
-                    print(f"\n    ⚠️ {current_model} límite diario alcanzado → probando {fallback_model}...", end=" ")
+                    print(f"\n    ⚠️ {current_model} límite diario alcanzado → probando {fallback_model}...", end=" ", flush=True)
                     current_model = fallback_model
                     time.sleep(2)
                     continue
@@ -787,17 +787,17 @@ def extract_maximas(client, primary_model, fallback_model, text_chunk,
             )
             if is_busy:
                 if fallback_model and current_model != fallback_model:
-                    print(f"\n    ⚠️ {current_model} saturado → {fallback_model}", end=" ")
+                    print(f"\n    ⚠️ {current_model} saturado → {fallback_model}", end=" ", flush=True)
                     current_model = fallback_model
                 elif fallback_model and current_model == fallback_model and primary_model != fallback_model:
                     current_model = primary_model
                 wait = 4 * attempt
                 if attempt < max_retries:
-                    print(f"\n    ⏳ Reintentando en {wait}s...", end=" ")
+                    print(f"\n    ⏳ Reintentando en {wait}s...", end=" ", flush=True)
                     time.sleep(wait)
                     continue
             else:
-                print(f"\n    ⚠ Error ({current_model}): {e}")
+                print(f"\n    ⚠ Error ({current_model}): {e}", flush=True)
                 time.sleep(2)
 
     return [], False, last_error
@@ -1461,13 +1461,13 @@ def main():
                 continue
 
             # Descargar texto
-            print("     📥 Descargando texto...", end=" ")
+            print("     📥 Descargando texto...", end=" ", flush=True)
             texto = descargar_texto_sentencia(session, url)
             if not texto:
-                print("✘ No se pudo descargar")
+                print("✘ No se pudo descargar", flush=True)
                 hubo_errores_graves_en_dia = True
                 continue
-            print(f"✔ ({len(texto):,} caracteres)")
+            print(f"✔ ({len(texto):,} caracteres)", flush=True)
 
             if not ponente:
                 ponente = extraer_ponente_de_texto(texto)
@@ -1486,13 +1486,13 @@ def main():
 
             # Aislar el capítulo decisorio previo a la DECISIÓN / DISPOSITIVO
             texto_decisorio, nombre_cap = aislar_capitulo_decisorio(texto)
-            print(f"     🎯 Capítulo decisorio: '{nombre_cap}' ({len(texto_decisorio):,} de {len(texto):,} caracteres)")
+            print(f"     🎯 Capítulo decisorio: '{nombre_cap}' ({len(texto_decisorio):,} de {len(texto):,} caracteres)", flush=True)
 
             chunks = chunk_text(texto_decisorio)
             total_chunks = len(chunks)
             pendientes = obtener_bloques_a_procesar(conn, archivo_id, total_chunks, reprocess_all)
 
-            print(f"     📄 Bloques: {total_chunks} total, {len(pendientes)} pendiente(s)")
+            print(f"     📄 Bloques: {total_chunks} total, {len(pendientes)} pendiente(s)", flush=True)
 
             if not pendientes:
                 print("     ✨ Esta sentencia ya estaba procesada exitosamente.")
@@ -1504,12 +1504,12 @@ def main():
             for count, c_num in enumerate(pendientes, 1):
                 # Verificar si ya se alcanzó el tope para esta decisión (ej: máx 1 para inadmisible/desestimado)
                 if max_m > 0 and len(maximas_sentencia) >= max_m:
-                    print(f"     ⏩ Cuota alcanzada ({len(maximas_sentencia)}/{max_m} máximas). Omitiendo bloque {c_num}.")
+                    print(f"     ⏩ Cuota alcanzada ({len(maximas_sentencia)}/{max_m} máximas). Omitiendo bloque {c_num}.", flush=True)
                     guardar_estado_bloque(conn, archivo_id, c_num, total_chunks, "EXITOSO", 0, "Cuota alcanzada")
                     continue
 
                 chunk = chunks[c_num - 1]
-                print(f"     🔄 [{count}/{len(pendientes)}] Analizando bloque {c_num}/{total_chunks}...", end=" ")
+                print(f"     🔄 [{count}/{len(pendientes)}] Analizando bloque {c_num}/{total_chunks}...", end=" ", flush=True)
 
                 cupo_disponible = max_m - len(maximas_sentencia) if max_m > 0 else 0
                 try:
@@ -1518,7 +1518,7 @@ def main():
                         instruccion_pauta=instruccion_pauta, max_permitidas=cupo_disponible,
                     )
                 except LimiteDiarioExcedidoError as e:
-                    print(f"\n     🛑 {e}")
+                    print(f"\n     🛑 {e}", flush=True)
                     limite_diario_alcanzado = True
                     hubo_errores_graves_en_dia = True
                     guardar_estado_bloque(conn, archivo_id, c_num, total_chunks, "ERROR", 0, str(e))
@@ -1526,7 +1526,7 @@ def main():
 
                 if ok:
                     guardar_estado_bloque(conn, archivo_id, c_num, total_chunks, "EXITOSO", len(maximas))
-                    print(f"✔ ({len(maximas)} máximas)")
+                    print(f"✔ ({len(maximas)} máximas)", flush=True)
                     if maximas:
                         for m in maximas:
                             m["numero"] = numero
@@ -1538,7 +1538,7 @@ def main():
                 else:
                     guardar_estado_bloque(conn, archivo_id, c_num, total_chunks, "ERROR", 0, err)
                     bloques_error.append(c_num)
-                    print(f"✘ {err[:60]}...")
+                    print(f"✘ {err[:60]}...", flush=True)
 
                 time.sleep(2)
 
@@ -1548,12 +1548,12 @@ def main():
 
             # Pase de recuperación para bloques con error
             if bloques_error and (max_m == 0 or len(maximas_sentencia) < max_m):
-                print(f"\n     ⚠️  {len(bloques_error)} bloque(s) con error. Iniciando recuperación...")
+                print(f"\n     ⚠️  {len(bloques_error)} bloque(s) con error. Iniciando recuperación...", flush=True)
                 time.sleep(6)
                 for r in list(bloques_error):
                     if max_m > 0 and len(maximas_sentencia) >= max_m:
                         break
-                    print(f"     🔁 Reintentando bloque {r}...", end=" ")
+                    print(f"     🔁 Reintentando bloque {r}...", end=" ", flush=True)
                     cupo_disponible = max_m - len(maximas_sentencia) if max_m > 0 else 0
                     try:
                         maximas, ok, err = extract_maximas(
@@ -1562,7 +1562,7 @@ def main():
                             max_retries=5,
                         )
                     except LimiteDiarioExcedidoError as e:
-                        print(f"\n     🛑 {e}")
+                        print(f"\n     🛑 {e}", flush=True)
                         limite_diario_alcanzado = True
                         hubo_errores_graves_en_dia = True
                         guardar_estado_bloque(conn, archivo_id, r, total_chunks, "ERROR", 0, str(e))
@@ -1570,7 +1570,7 @@ def main():
 
                     if ok:
                         guardar_estado_bloque(conn, archivo_id, r, total_chunks, "EXITOSO", len(maximas))
-                        print(f"✔ RECUPERADO ({len(maximas)} máximas)")
+                        print(f"✔ RECUPERADO ({len(maximas)} máximas)", flush=True)
                         bloques_error.remove(r)
                         if maximas:
                             for m in maximas:
@@ -1582,7 +1582,7 @@ def main():
                             maximas_sentencia.extend(maximas)
                     else:
                         guardar_estado_bloque(conn, archivo_id, r, total_chunks, "ERROR", 0, err)
-                        print("✘ Fallido.")
+                        print("✘ Fallido.", flush=True)
                         hubo_errores_graves_en_dia = True
                     time.sleep(3)
 
