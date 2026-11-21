@@ -12,7 +12,7 @@ permissions:
 jobs:
   extraer-jurisprudencia:
     runs-on: self-hosted
-    timeout-minutes: 60
+    timeout-minutes: 180
 
     steps:
       - name: 1. Descargar repositorio
@@ -34,6 +34,7 @@ jobs:
           "%PY%" -u extractor_web.py
 
       - name: 3. Guardar cambios en GitHub
+        if: always()
         shell: cmd
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
