@@ -329,7 +329,7 @@ def descargar_texto_sentencia(session, url):
         resp = session.get(url, headers={
             "User-Agent": HEADERS["User-Agent"],
             "Accept": "text/html,application/xhtml+xml,*/*",
-        }, timeout=60)
+        }, timeout=(10, 30))
         resp.raise_for_status()
 
         resp.encoding = resp.apparent_encoding or "latin-1"
