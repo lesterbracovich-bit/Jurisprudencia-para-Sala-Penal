@@ -1824,7 +1824,7 @@ def main():
         print("   Se agotó la cuota disponible en Gemini y/o OpenRouter por el día de hoy.")
         print("   Todas las máximas y sentencias procesadas con éxito están aseguradas en la BD.")
         print("   Las sentencias restantes quedaron registradas y se retomarán automáticamente")
-        print("   en la próxima ejecución programada (a las 7:00 PM).")
+        print("   en la próxima ejecución programada (a las 8:15 PM).")
         print("=" * 60)
         conn.commit()
     elif tiempo_limite_alcanzado:
