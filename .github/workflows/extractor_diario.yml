@@ -2,8 +2,8 @@ name: Extracción Diaria de Jurisprudencia TSJ
 
 on:
   schedule:
-    # 23:00 UTC = 7:00 PM (19:00) hora de Venezuela (UTC-4) todos los días
-    - cron: '0 23 * * *'
+    # 00:15 UTC = 8:15 PM (20:15) hora de Venezuela (UTC-4) todos los días
+    - cron: '15 0 * * *'
   workflow_dispatch:
 
 permissions:
