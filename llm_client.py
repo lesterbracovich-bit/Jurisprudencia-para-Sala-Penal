@@ -88,6 +88,8 @@ class ModelSlot:
     is_free_openrouter: bool = False
     verified: bool = False
     exhausted: bool = False
+    consecutive_busy: int = 0
+    demoted: bool = False
 
     @property
     def display_name(self) -> str:
@@ -701,6 +703,29 @@ class MultiProviderClient:
                     status_txt = info_key if ok_key else f"inválida ({info_key})"
                     print(f"  • OpenRouter #{idx + 1}: 0 env. (sin uso en esta corrida | {status_txt})")
 
+    def _demote_slot(self, slot: ModelSlot) -> bool:
+        """
+        Mueve un slot crónicamente saturado al final de su bloque (proveedor, clave)
+        para priorizar automáticamente los modelos que sí están respondiendo.
+        """
+        same_group_indices = [
+            i for i, s in enumerate(self.slots)
+            if s.provider == slot.provider and s.key_index == slot.key_index and not s.exhausted
+        ]
+        if len(same_group_indices) <= 1:
+            return False
+        cur_idx = self.slots.index(slot)
+        last_idx = same_group_indices[-1]
+        if cur_idx == last_idx:
+            return False
+        self.slots.pop(cur_idx)
+        # Al quitar cur_idx (< last_idx), el antiguo last_idx queda en last_idx - 1;
+        # insertar justo en last_idx lo coloca inmediatamente detrás de ese grupo.
+        self.slots.insert(last_idx, slot)
+        slot.demoted = True
+        slot.consecutive_busy = 0
+        return True
+
     def _mark_exhausted(self, slot: ModelSlot, kind: str) -> None:
         if kind == "auth_or_payment":
             for s in self.slots:
@@ -731,7 +756,7 @@ class MultiProviderClient:
         slot_pos = 0
         if preferred_label:
             for idx, s in enumerate(active):
-                if s.display_name == preferred_label:
+                if s.display_name == preferred_label and not s.demoted:
                     slot_pos = idx
                     break
 
@@ -761,6 +786,7 @@ class MultiProviderClient:
 
                 parsed = parse_json_list(raw)
                 if parsed is not None:
+                    slot.consecutive_busy = 0
                     return parsed, True, ""
 
                 parse_failures += 1
@@ -801,11 +827,28 @@ class MultiProviderClient:
                     continue
 
                 transient_failures += 1
+                next_slot = None
                 if len(active) > 1:
-                    slot_pos = (slot_pos + 1) % len(active)
-                    next_slot = active[slot_pos]
+                    next_target = active[(slot_pos + 1) % len(active)]
+                    demoted_now = False
                     if kind == "busy":
-                        print(f"\n    ⚠️ {slot.display_name} saturado → {next_slot.display_name}", end=" ", flush=True)
+                        slot.consecutive_busy += 1
+                        if slot.consecutive_busy >= 2:
+                            demoted_now = self._demote_slot(slot)
+                    else:
+                        slot.consecutive_busy = 0
+
+                    updated_active = self.active_slots()
+                    if next_target in updated_active:
+                        slot_pos = updated_active.index(next_target)
+                        next_slot = next_target
+                    else:
+                        slot_pos = 0
+                        next_slot = updated_active[0]
+
+                    if kind == "busy":
+                        suffix_demote = " (relegado por saturación)" if demoted_now else ""
+                        print(f"\n    ⚠️ {slot.display_name} saturado{suffix_demote} → {next_slot.display_name}", end=" ", flush=True)
                     else:
                         print(f"\n    ⚠ Error ({slot.display_name}): {_short_error(exc)} → {next_slot.display_name}", end=" ", flush=True)
                 else:
@@ -814,7 +857,7 @@ class MultiProviderClient:
                 if transient_failures >= max_retries:
                     break
 
-                switched_provider = len(active) > 1 and next_slot.provider != slot.provider
+                switched_provider = next_slot is not None and next_slot.provider != slot.provider
                 if switched_provider:
                     wait = 1.5
                 elif kind == "busy":
