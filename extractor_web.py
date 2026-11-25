@@ -56,7 +56,13 @@ except ImportError:
     print("=" * 60)
     sys.exit(1)
 
-from google import genai
+from llm_client import (
+    LimiteDiarioExcedidoError,
+    PREFERRED_GEMINI_MODELS,
+    PREFERRED_OPENROUTER_MODELS,
+    init_client as _init_llm_client,
+    select_model,
+)
 
 # ─── Configuración General ───────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -64,24 +70,11 @@ DB_PATH = os.path.join(BASE_DIR, "jurisprudencia_ia.db")
 CSV_PATH = os.path.join(BASE_DIR, "reporte_jurisprudencia.csv")
 
 API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 
-class LimiteDiarioExcedidoError(Exception):
-    """Excepción lanzada cuando se agota la cuota diaria (RPD) de la API de Gemini."""
-    pass
-
-
-# Modelos Gemini en orden de preferencia (disponibles en AI Studio)
-PREFERRED_MODELS = [
-    "gemini-3.8-flash",      # Modelo principal (rápido, ágil y de alta cuota)
-    "gemini-4-hydrogen",     # Modelo de respaldo (alta capacidad de análisis y precisión)
-    "gemini-3.6-flash",      # Respaldo confiable adicional
-    "gemini-3.5-flash-lite", # Respaldo liviano
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
-    "gemini-4-argon",
-    "gemini-4-neon",
-]
+# Modelos en orden de preferencia
+PREFERRED_MODELS = list(PREFERRED_GEMINI_MODELS)
+OPENROUTER_MODELS = list(PREFERRED_OPENROUTER_MODELS)
 
 CHUNK_SIZE = 25_000
 CHUNK_OVERLAP = 3_000
@@ -141,65 +134,16 @@ MESES_MAP = {
 }
 
 
-# ─── Inicialización de Gemini ────────────────────────────────────────────────
+# ─── Inicialización de Proveedores IA ────────────────────────────────────────
 def init_client():
-    """Crea e inicializa el cliente de Google GenAI."""
-    key = os.environ.get("GEMINI_API_KEY", "").strip() or API_KEY
-    if not key or key in ("TU_CLAVE_API_AQUI", "None", ""):
-        print("=" * 60)
-        print("⚠  ATENCIÓN: No se ha detectado la variable de entorno GEMINI_API_KEY.")
-        print("   Asegúrate de configurarla en los secretos de tu repositorio GitHub")
-        print("   (Settings > Secrets and variables > Actions > GEMINI_API_KEY)")
-        print("   o definirla en el entorno antes de ejecutar.")
-        print("=" * 60)
-        sys.exit(1)
-    return genai.Client(api_key=key, http_options={"timeout": 180000})
-
-
-def select_model(client):
-    """
-    Selección inteligente de modelo con respaldo.
-    Prueba los modelos preferidos y devuelve una tupla (primario, respaldo).
-    """
-    funcionales = []
-    for model_name in PREFERRED_MODELS:
-        try:
-            print(f"  Probando modelo: {model_name} ...", end=" ", flush=True)
-            response = client.models.generate_content(
-                model=model_name, contents="Responde solo: OK",
-            )
-            if response and response.text:
-                print("✔ disponible", flush=True)
-                funcionales.append(model_name)
-                if len(funcionales) >= 2:
-                    break
-        except Exception as e:
-            print(f"✘ ({type(e).__name__})", flush=True)
-
-    if funcionales:
-        return funcionales[0], funcionales[1] if len(funcionales) > 1 else funcionales[0]
-
-    # Búsqueda dinámica si ninguno preferido funcionó
-    print("\n  Buscando modelos dinámicamente en la cuenta...", flush=True)
-    try:
-        for m in client.models.list():
-            name = m.name
-            if "gemini" not in name.lower():
-                continue
-            short = name.replace("models/", "")
-            try:
-                print(f"  Probando: {short} ...", end=" ", flush=True)
-                resp = client.models.generate_content(model=short, contents="Responde solo: OK")
-                if resp and resp.text:
-                    print("✔ disponible", flush=True)
-                    return short, short
-            except Exception:
-                print("✘", flush=True)
-    except Exception as e:
-        print(f"  Error al listar modelos: {e}", flush=True)
-
-    print("\n❌ No se encontró ningún modelo Gemini disponible.")
-    sys.exit(1)
+    """Crea e inicializa el cliente multi-proveedor (Gemini + OpenRouter)."""
+    return _init_llm_client(
+        gemini_models=PREFERRED_MODELS,
+        openrouter_models=OPENROUTER_MODELS,
+        inline_gemini_key=API_KEY,
+        inline_openrouter_key=OPENROUTER_API_KEY,
+        timeout_ms=180000,
+    )
 
 
 # ─── Consultas a la API del TSJ ──────────────────────────────────────────────
@@ -704,14 +648,11 @@ Si no encuentras máximas válidas, devuelve: []
 TEXTO DEL CAPÍTULO DECISORIO:
 """
 
-JSON_ARRAY_RE = re.compile(r"\[.*\]", re.DOTALL)
-
-
 def extract_maximas(client, primary_model, fallback_model, text_chunk,
                     numero, fecha, ponente, instruccion_pauta="", max_permitidas=0,
                     max_retries=4):
     """
-    Envía el texto de una sentencia al modelo para extraer máximas originales.
+    Envía el texto de una sentencia al cliente multi-proveedor para extraer máximas originales.
     Retorna (maximas_list, exito, error_msg).
     """
     prompt = MAXIMAS_PROMPT.format(
@@ -719,88 +660,16 @@ def extract_maximas(client, primary_model, fallback_model, text_chunk,
         instruccion_pauta=instruccion_pauta
     ) + text_chunk
 
-    current_model = primary_model
-    last_error = ""
-
-    for attempt in range(1, max_retries + 1):
-        try:
-            response = client.models.generate_content(
-                model=current_model, contents=prompt,
-            )
-            raw = (response.text or "").strip()
-            if not raw:
-                raise ValueError("Respuesta vacía del modelo.")
-
-            sentencias = None
-            try:
-                data = json.loads(raw)
-                if isinstance(data, list):
-                    sentencias = data
-            except json.JSONDecodeError:
-                pass
-
-            if sentencias is None:
-                match = JSON_ARRAY_RE.search(raw)
-                if match:
-                    try:
-                        data = json.loads(match.group())
-                        if isinstance(data, list):
-                            sentencias = data
-                    except json.JSONDecodeError:
-                        pass
-
-            if sentencias is not None:
-                # Aplicar límite máximo si corresponde
-                if max_permitidas > 0 and len(sentencias) > max_permitidas:
-                    sentencias = sentencias[:max_permitidas]
-                return sentencias, True, ""
-            else:
-                last_error = "Formato JSON no interpretable."
-                continue
-
-        except Exception as e:
-            error_msg = str(e)
-            last_error = error_msg
-
-            # Detección de límite diario alcanzado (Free Tier RPD)
-            is_daily_limit = any(
-                k in error_msg.lower()
-                for k in [
-                    "limit: 20",
-                    "generate content requests per day limit exceeded",
-                    "free_tier_requests",
-                    "per day limit exceeded",
-                ]
-            )
-            if is_daily_limit:
-                if fallback_model and current_model != fallback_model:
-                    print(f"\n    ⚠️ {current_model} límite diario alcanzado → probando {fallback_model}...", end=" ", flush=True)
-                    current_model = fallback_model
-                    time.sleep(2)
-                    continue
-                else:
-                    raise LimiteDiarioExcedidoError(f"Cuota diaria agotada en Gemini API (Free Tier): {error_msg}")
-
-            is_busy = any(
-                k in error_msg
-                for k in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"]
-            )
-            if is_busy:
-                if fallback_model and current_model != fallback_model:
-                    print(f"\n    ⚠️ {current_model} saturado → {fallback_model}", end=" ", flush=True)
-                    current_model = fallback_model
-                elif fallback_model and current_model == fallback_model and primary_model != fallback_model:
-                    current_model = primary_model
-                wait = 4 * attempt
-                if attempt < max_retries:
-                    print(f"\n    ⏳ Reintentando en {wait}s...", end=" ", flush=True)
-                    time.sleep(wait)
-                    continue
-            else:
-                print(f"\n    ⚠ Error ({current_model}): {e}", flush=True)
-                time.sleep(2)
-
-    return [], False, last_error
+    sentencias, ok, err = client.extract_json_list(
+        prompt=prompt,
+        preferred_label=primary_model,
+        max_retries=max_retries,
+    )
+    if ok:
+        if max_permitidas > 0 and len(sentencias) > max_permitidas:
+            sentencias = sentencias[:max_permitidas]
+        return sentencias, True, ""
+    return [], False, err
 
 
 # ─── Base de Datos y Seguimiento ─────────────────────────────────────────────
@@ -1402,13 +1271,16 @@ def main():
         conn.close()
         return
 
-    # 2) Inicializar cliente Gemini y seleccionar modelos
-    print("\n🤖 Inicializando conexión con Google Gemini...")
+    # 2) Inicializar cliente multi-proveedor y seleccionar modelos
+    print("\n🤖 Inicializando conexión con los proveedores de IA...")
     client = init_client()
     print("\n🔍 Verificando modelos disponibles (primario y respaldo)...")
     primary, fallback = select_model(client)
     print(f"\n✅ Modelo Primario: {primary}")
     print(f"🛡️  Modelo de Respaldo: {fallback}")
+    or_backup = client.describe_openrouter_backup()
+    if or_backup and not primary.startswith("openrouter:"):
+        print(f"🔀 Respaldo OpenRouter: {or_backup}")
 
     # 3) Procesar día a día
     total_general_ins = 0
@@ -1611,8 +1483,8 @@ def main():
 
     if limite_diario_alcanzado:
         print("\n" + "=" * 60)
-        print("🛑 LÍMITE DIARIO DE LA API DE GEMINI ALCANZADO (ERROR 429)")
-        print("   Se alcanzó el tope de peticiones del plan Free Tier por el día de hoy.")
+        print("🛑 LÍMITE DE CUOTA ALCANZADO EN LOS PROVEEDORES CONFIGURADOS")
+        print("   Se agotó la cuota disponible en Gemini y/o OpenRouter por el día de hoy.")
         print("   Todas las máximas y sentencias procesadas con éxito están aseguradas en la BD.")
         print("   Las sentencias restantes quedaron registradas y se retomarán automáticamente")
         print("   en la próxima ejecución programada (a las 7:00 PM).")
