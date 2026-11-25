@@ -9,6 +9,7 @@ almacenados en SQLite (jurisprudencia_ia.db).
 """
 
 import os
+import re
 import sqlite3
 import pandas as pd
 import streamlit as st
@@ -188,6 +189,42 @@ def load_data():
     return df
 
 
+def _parse_fecha_sort(valor: str):
+    """Convierte la fecha en formato texto a Timestamp para orden cronológico."""
+    if not valor:
+        return pd.NaT
+    texto = str(valor).strip()
+    if texto.lower() in ("s/f", "sin fecha", "none", "null", ""):
+        return pd.NaT
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"):
+        ts = pd.to_datetime(texto, format=fmt, errors="coerce")
+        if pd.notna(ts):
+            return ts
+    return pd.to_datetime(texto, dayfirst=True, errors="coerce")
+
+
+def _parse_numero_sort(valor: str) -> int:
+    """Extrae la parte numérica del número de sentencia para desempate en la misma fecha."""
+    m = re.search(r"\d+", str(valor or ""))
+    return int(m.group()) if m else 0
+
+
+def ordenar_cronologicamente(df: pd.DataFrame, ascendente: bool = False) -> pd.DataFrame:
+    """Ordena el DataFrame cronológicamente por fecha y número de sentencia."""
+    if df.empty:
+        return df
+    df_ord = df.copy()
+    df_ord["_fecha_sort"] = df_ord["fecha"].map(_parse_fecha_sort)
+    df_ord["_num_sort"] = df_ord["numero"].map(_parse_numero_sort)
+    df_ord = df_ord.sort_values(
+        by=["_fecha_sort", "_num_sort", "id"],
+        ascending=[ascendente, ascendente, ascendente],
+        na_position="last",
+        kind="mergesort",
+    )
+    return df_ord.drop(columns=["_fecha_sort", "_num_sort"]).reset_index(drop=True)
+
+
 def get_sala_badge_class(sala: str) -> str:
     """Devuelve clase CSS acorde a la sala para destacar visualmente con alto contraste."""
     sala_lower = sala.lower()
@@ -233,8 +270,14 @@ def main():
 
         st.divider()
 
-        # Selector de Límite de Visualización
+        # Selector de Límite de Visualización y Orden Cronológico
         st.subheader("📑 Visualización")
+        orden_opcion = st.selectbox(
+            "Orden cronológico:",
+            options=["Más recientes primero", "Más antiguas primero"],
+            index=0,
+            help="Ordena las sentencias por su fecha de publicación (las entradas sin fecha se muestran al final).",
+        )
         limite_opcion = st.selectbox(
             "Criterios en pantalla:",
             options=[20, 50, 100, "Todos"],
@@ -260,6 +303,11 @@ def main():
                 | df_filtrado["numero"].astype(str).str.lower().str.contains(termino, na=False)
             )
             df_filtrado = df_filtrado[condicion]
+
+        # Ordenar cronológicamente antes de mostrar lista rápida y tarjetas
+        df_filtrado = ordenar_cronologicamente(
+            df_filtrado, ascendente=(orden_opcion == "Más antiguas primero")
+        )
 
         # ─── Panel de Resultados en la Barra Lateral ──────────────────────────
         hay_filtro = bool(busqueda_lateral.strip()) or (sala_seleccionada != "Todas las Salas")
@@ -287,7 +335,7 @@ def main():
         with col_m1:
             st.metric("Total Extractos", len(df))
         with col_m2:
-            sentencias_unicas = len(df.drop_duplicates(subset=["numero", "sala"]))
+            sentencias_unicas = len(df.drop_duplicates(subset=["numero", "sala", "fecha"]))
             st.metric("Sentencias Únicas", sentencias_unicas)
         
         st.markdown("**Distribución por Sala:**")
@@ -337,8 +385,8 @@ def main():
     if "pagina_actual" not in st.session_state:
         st.session_state["pagina_actual"] = 1
 
-    # Resetear a página 1 si cambian los filtros o búsqueda
-    firma_filtro = (sala_seleccionada, busqueda_lateral.strip(), busqueda_principal.strip(), str(limite_opcion))
+    # Resetear a página 1 si cambian los filtros, búsqueda u orden
+    firma_filtro = (sala_seleccionada, busqueda_lateral.strip(), busqueda_principal.strip(), orden_opcion, str(limite_opcion))
     if st.session_state.get("ultima_firma_filtro") != firma_filtro:
         st.session_state["pagina_actual"] = 1
         st.session_state["ultima_firma_filtro"] = firma_filtro
