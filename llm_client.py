@@ -299,6 +299,7 @@ class MultiProviderClient:
         self.primary_label: str = ""
         self.fallback_label: str = ""
         self._http = requests.Session()
+        self._usage_stats: dict[tuple[str, int, str], dict[str, int]] = {}
 
         for key in self.gemini_keys:
             if genai is None:
@@ -308,12 +309,37 @@ class MultiProviderClient:
                 kwargs["http_options"] = {"timeout": timeout_ms}
             self.gemini_clients.append(genai.Client(**kwargs))
 
-    def _invoke_gemini(self, key_index: int, model: str, prompt: str) -> str:
-        response = self.gemini_clients[key_index].models.generate_content(
-            model=model,
-            contents=prompt,
+    def _record_usage(self, provider: str, key_index: int, model: str, is_probe: bool, ok: bool) -> None:
+        key = (provider, key_index, model)
+        entry = self._usage_stats.setdefault(
+            key,
+            {"sent": 0, "probes": 0, "probe_ok": 0, "extract_ok": 0, "errors": 0},
         )
-        return (response.text or "").strip()
+        entry["sent"] += 1
+        if is_probe:
+            entry["probes"] += 1
+            if ok:
+                entry["probe_ok"] += 1
+            else:
+                entry["errors"] += 1
+        else:
+            if ok:
+                entry["extract_ok"] += 1
+            else:
+                entry["errors"] += 1
+
+    def _invoke_gemini(self, key_index: int, model: str, prompt: str, is_probe: bool = False) -> str:
+        try:
+            response = self.gemini_clients[key_index].models.generate_content(
+                model=model,
+                contents=prompt,
+            )
+            text = (response.text or "").strip()
+            self._record_usage("gemini", key_index, model, is_probe=is_probe, ok=bool(text))
+            return text
+        except Exception:
+            self._record_usage("gemini", key_index, model, is_probe=is_probe, ok=False)
+            raise
 
     def _invoke_openrouter(self, key_index: int, model: str, prompt: str, is_probe: bool = False) -> str:
         api_key = self.openrouter_keys[key_index]
@@ -332,32 +358,40 @@ class MultiProviderClient:
         if is_probe:
             payload["reasoning"] = {"effort": "low"}
 
-        resp = self._http.post(
-            OPENROUTER_CHAT_URL,
-            headers=headers,
-            json=payload,
-            timeout=30 if is_probe else self.timeout_seconds,
-        )
-        if resp.status_code >= 400:
-            err_msg = resp.text[:300]
-            try:
-                body = resp.json()
-                err_obj = body.get("error") or {}
-                meta_raw = ((err_obj.get("metadata") or {}).get("raw")) or ""
-                msg = err_obj.get("message") or err_msg
-                err_msg = f"{msg} ({meta_raw})" if meta_raw and meta_raw not in msg else msg
-            except ValueError:
-                pass
+        try:
+            resp = self._http.post(
+                OPENROUTER_CHAT_URL,
+                headers=headers,
+                json=payload,
+                timeout=30 if is_probe else self.timeout_seconds,
+            )
+            if resp.status_code >= 400:
+                err_msg = resp.text[:300]
+                try:
+                    body = resp.json()
+                    err_obj = body.get("error") or {}
+                    meta_raw = ((err_obj.get("metadata") or {}).get("raw")) or ""
+                    msg = err_obj.get("message") or err_msg
+                    err_msg = f"{msg} ({meta_raw})" if meta_raw and meta_raw not in msg else msg
+                except ValueError:
+                    pass
 
-            # Si el modelo no acepta el parámetro opcional 'reasoning' en un probe, reintentar sin él
-            if is_probe and resp.status_code == 400 and "reasoning" in err_msg.lower():
-                payload.pop("reasoning", None)
-                resp = self._http.post(OPENROUTER_CHAT_URL, headers=headers, json=payload, timeout=30)
-                if resp.status_code < 400:
-                    return self._extract_openrouter_content(resp)
-            raise ProviderHTTPError(resp.status_code, err_msg, provider="openrouter", headers=dict(resp.headers))
+                # Si el modelo no acepta el parámetro opcional 'reasoning' en un probe, reintentar sin él
+                if is_probe and resp.status_code == 400 and "reasoning" in err_msg.lower():
+                    payload.pop("reasoning", None)
+                    resp = self._http.post(OPENROUTER_CHAT_URL, headers=headers, json=payload, timeout=30)
+                    if resp.status_code < 400:
+                        text = self._extract_openrouter_content(resp)
+                        self._record_usage("openrouter", key_index, model, is_probe=is_probe, ok=bool(text))
+                        return text
+                raise ProviderHTTPError(resp.status_code, err_msg, provider="openrouter", headers=dict(resp.headers))
 
-        return self._extract_openrouter_content(resp)
+            text = self._extract_openrouter_content(resp)
+            self._record_usage("openrouter", key_index, model, is_probe=is_probe, ok=bool(text))
+            return text
+        except Exception:
+            self._record_usage("openrouter", key_index, model, is_probe=is_probe, ok=False)
+            raise
 
     @staticmethod
     def _extract_openrouter_content(resp: requests.Response) -> str:
@@ -434,7 +468,7 @@ class MultiProviderClient:
             tag = f"{model_name}" if key_index == 0 else f"{model_name} [{label}]"
             print(f"  Probando modelo: {tag} ...", end=" ", flush=True)
             ok, err = self._probe_call(
-                lambda m=model_name: self._invoke_gemini(key_index, m, "Responde solo: OK"),
+                lambda m=model_name: self._invoke_gemini(key_index, m, "Responde solo: OK", is_probe=True),
                 tag,
             )
             if ok:
@@ -466,7 +500,7 @@ class MultiProviderClient:
                     break
                 print(f"  Probando dinámico: {short} ...", end=" ", flush=True)
                 ok, err = self._probe_call(
-                    lambda s=short: self._invoke_gemini(key_index, s, "Responde solo: OK"),
+                    lambda s=short: self._invoke_gemini(key_index, s, "Responde solo: OK", is_probe=True),
                     short,
                 )
                 if ok:
@@ -580,6 +614,92 @@ class MultiProviderClient:
         first = or_slots[0].display_name
         extra = len(or_slots) - 1
         return f"{first} (+ {extra} modelo(s) en reserva)" if extra > 0 else first
+
+    def get_usage_summary(self) -> dict[str, Any]:
+        """Devuelve métricas acumuladas de peticiones enviadas por proveedor y modelo."""
+        total_sent = 0
+        total_probes = 0
+        total_extract_ok = 0
+        total_errors = 0
+        by_provider: dict[tuple[str, int], dict[str, Any]] = {}
+
+        for (provider, key_index, model), counts in self._usage_stats.items():
+            sent = counts["sent"]
+            probes = counts["probes"]
+            extract_ok = counts["extract_ok"]
+            errors = counts["errors"]
+            total_sent += sent
+            total_probes += probes
+            total_extract_ok += extract_ok
+            total_errors += errors
+
+            group = by_provider.setdefault(
+                (provider, key_index),
+                {
+                    "provider": provider,
+                    "key_index": key_index,
+                    "label": f"{'Gemini' if provider == 'gemini' else 'OpenRouter'} #{key_index + 1}",
+                    "sent": 0,
+                    "probes": 0,
+                    "extract_ok": 0,
+                    "errors": 0,
+                    "models": {},
+                },
+            )
+            group["sent"] += sent
+            group["probes"] += probes
+            group["extract_ok"] += extract_ok
+            group["errors"] += errors
+            group["models"][model] = dict(counts)
+
+        return {
+            "total_sent": total_sent,
+            "total_probes": total_probes,
+            "total_extractions": total_sent - total_probes,
+            "total_extract_ok": total_extract_ok,
+            "total_errors": total_errors,
+            "by_provider": list(by_provider.values()),
+        }
+
+    def print_usage_summary(self, check_openrouter_quota: bool = True) -> None:
+        """Imprime el resumen de peticiones enviadas a cada proveedor/modelo (sin gastar cuota)."""
+        summary = self.get_usage_summary()
+        print(f"\n  ── Peticiones a APIs de IA ──────────────────────────────")
+        print(
+            f"  📡 Total peticiones enviadas:  {summary['total_sent']} "
+            f"(inicio: {summary['total_probes']} | extracción: {summary['total_extractions']})"
+        )
+        print(
+            f"  ✔️  Extracciones exitosas:     {summary['total_extract_ok']} "
+            f"| ❌ Fallos/reintentos API: {summary['total_errors']}"
+        )
+
+        printed_or_keys: set[int] = set()
+        for grp in summary["by_provider"]:
+            extra_quota = ""
+            if grp["provider"] == "openrouter" and check_openrouter_quota:
+                printed_or_keys.add(grp["key_index"])
+                ok_key, info_key = self._validate_openrouter_key(grp["key_index"])
+                if ok_key and info_key:
+                    extra_quota = f" | estado: {info_key}"
+            print(
+                f"  • {grp['label']}: {grp['sent']} env. "
+                f"(inicio: {grp['probes']}, extracción ok: {grp['extract_ok']}, errores: {grp['errors']}){extra_quota}"
+            )
+            for model, cnt in grp["models"].items():
+                ext_sent = cnt["sent"] - cnt["probes"]
+                print(
+                    f"      - {model}: {cnt['sent']} env. "
+                    f"(inicio: {cnt['probes']}, ext: {ext_sent}, ok: {cnt['extract_ok']}, errores: {cnt['errors']})"
+                )
+
+        # Si hay claves de OpenRouter en reserva que no se llegaron a usar, mostrar su cuota restante
+        if check_openrouter_quota:
+            for idx in range(len(self.openrouter_keys)):
+                if idx not in printed_or_keys:
+                    ok_key, info_key = self._validate_openrouter_key(idx)
+                    status_txt = info_key if ok_key else f"inválida ({info_key})"
+                    print(f"  • OpenRouter #{idx + 1}: 0 env. (sin uso en esta corrida | {status_txt})")
 
     def _mark_exhausted(self, slot: ModelSlot, kind: str) -> None:
         if kind == "auth_or_payment":

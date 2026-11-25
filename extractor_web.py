@@ -1848,6 +1848,7 @@ def main():
     print(f"  📋 Total extractos en BD:      {total_ext}")
     print(f"  ⚖️  Sentencias únicas en BD:    {sent_unicas}")
     print(f"  🗄  Base de datos:              {DB_PATH}")
+    client.print_usage_summary()
 
     # 5) Exportar CSV
     export_csv(conn)
