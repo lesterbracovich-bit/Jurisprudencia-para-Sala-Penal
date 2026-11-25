@@ -24,7 +24,9 @@ Uso:
     python extractor_web.py --fecha 23/10/2026 # Procesa un solo día específico
     python extractor_web.py --desde 01/10/2026 # Procesa desde una fecha en adelante
     python extractor_web.py --todas            # Procesa todas las fechas publicadas del año
-    python extractor_web.py --reset-fecha      # Reinicia el registro de última fecha a cero
+    python extractor_web.py --historico        # Ejecuta revisión histórica (nulidades 2000-09/2026)
+    python extractor_web.py --reset-fecha      # Reinicia el registro de última fecha actual a cero
+    python extractor_web.py --reset-historico  # Reinicia el registro de fecha histórica a cero
     python extractor_web.py --reprocesar-todo  # Reprocesa bloques previamente completados
 """
 
@@ -84,6 +86,16 @@ SALA_ID = "003"           # Sala de Casación Penal en Liferay
 SALA_DIR = "scp"          # Subdirectorio en historico.tsj.gob.ve
 SALA_NOMBRE = "Sala de Casación Penal"
 ANO_DEFAULT = "2026"
+
+# ─── Modo Actual vs. Modo Histórico (Nulidades 2000–09/2026) ─────────────────
+FECHA_HIST_INICIO = date(2000, 1, 19)
+FECHA_HIST_FIN = date(2026, 9, 30)
+FECHA_ACTUAL_INICIO = date(2026, 10, 1)
+CLAVE_CONTROL_ACTUAL = f"ultima_fecha_procesada_{SALA_ID}"
+CLAVE_CONTROL_HIST = f"ultima_fecha_historica_{SALA_ID}"
+CLAVE_HIST_COMPLETADO = f"historico_completado_{SALA_ID}"
+HIST_MAX_DIAS_POR_RUN = 100
+HIST_MAX_MINUTOS_POR_RUN = 140
 
 # ─── Endpoints API TSJ (Liferay) ─────────────────────────────────────────────
 TSJ_BASE = "https://www.tsj.gob.ve/es/decisiones"
@@ -203,10 +215,11 @@ def obtener_dias_publicados(session, sala_id=SALA_ID, ano=ANO_DEFAULT):
     return dias
 
 
-def listar_sentencias_por_fecha(session, fecha_str, sala_id=SALA_ID):
+def listar_sentencias_por_fecha(session, fecha_str, sala_id=SALA_ID, return_ok=False):
     """
     Consulta la API JSON del portal Liferay para obtener la lista de
     sentencias publicadas en una fecha y sala específicas.
+    Si return_ok=True, devuelve (sentencias, consulta_exitosa).
     """
     fecha_encoded = quote(fecha_str, safe="")
     url = API_LIST_DECISIONS.format(
@@ -219,10 +232,10 @@ def listar_sentencias_por_fecha(session, fecha_str, sala_id=SALA_ID):
         data = resp.json()
     except requests.RequestException as e:
         print(f"    ⚠ Error consultando API del TSJ para {fecha_str}: {e}")
-        return []
+        return ([], False) if return_ok else []
     except json.JSONDecodeError:
         print(f"    ⚠ Respuesta no es JSON válido para {fecha_str}")
-        return []
+        return ([], False) if return_ok else []
 
     coleccion = data.get("coleccion", {})
     sentencias_raw = coleccion.get("SENTENCIA", [])
@@ -231,49 +244,59 @@ def listar_sentencias_por_fecha(session, fecha_str, sala_id=SALA_ID):
 
     sentencias = []
     for s in sentencias_raw:
-        nombre_doc = s.get("SSENTNOMBREDOC", "").strip()
-        if not nombre_doc:
+        nombre_doc = (s.get("SSENTNOMBREDOC") or "").strip()
+        if not nombre_doc or nombre_doc.lower() in ("null", "none", "-"):
             continue
 
         match = re.match(
             r"(\d+)-(\d+)-(\d+)-(\d{4})-(.+?)\.HTML?",
             nombre_doc, re.IGNORECASE
         )
+        raw_num_api = (s.get("SSENTNUMERO") or "").strip()
         if match:
             numero = match.group(2)
             expediente = match.group(5)
+        elif raw_num_api and raw_num_api.lower() not in ("null", "none", "-"):
+            numero = raw_num_api
+            expediente = (s.get("SSENTEXPEDIENTE") or "?").strip()
         else:
-            numero = "?"
-            expediente = s.get("SSENTEXPEDIENTE", "?")
+            match_old = re.match(r"^([A-Za-z]?-?\d+)-", nombre_doc)
+            numero = match_old.group(1) if match_old else str(s.get("SSENTID") or "?")
+            expediente = (s.get("SSENTEXPEDIENTE") or "?").strip()
 
-        nombre_mes = s.get("NOMBREMES", "").strip().lower()
-        sala_dir = s.get("SSALADIR", SALA_DIR).strip().lower()
-        doc_url = f"{TSJ_HISTORICO_BASE}/{sala_dir}/{nombre_mes}/{nombre_doc}"
+        if numero.isdigit():
+            numero = numero.lstrip("0") or "0"
+
+        nombre_mes = (s.get("NOMBREMES") or "").strip().lower()
+        sala_dir = (s.get("SSALADIR") or SALA_DIR).strip().lower()
+        doc_url = f"{TSJ_HISTORICO_BASE}/{sala_dir}/{quote(nombre_mes, safe='')}/{quote(nombre_doc, safe='().-_~')}"
 
         sentencias.append({
             "numero": numero,
             "fecha": fecha_str,
             "url": doc_url,
             "expediente": expediente,
-            "ponente": s.get("SPONENOMBRE", "").strip(),
-            "procedimiento": s.get("SPROCDESCRIPCION", "").strip(),
-            "partes": s.get("SSENTPARTES", "").strip(),
-            "decision_resumen": s.get("SSENTDECISION", "").strip(),
+            "ponente": (s.get("SPONENOMBRE") or "").strip(),
+            "procedimiento": (s.get("SPROCDESCRIPCION") or "").strip(),
+            "partes": (s.get("SSENTPARTES") or "").strip(),
+            "decision_resumen": (s.get("SSENTDECISION") or "").strip(),
             "archivo": nombre_doc,
         })
 
-    return sentencias
+    return (sentencias, True) if return_ok else sentencias
 
 
-def descargar_texto_sentencia(session, url):
+def descargar_texto_sentencia(session, url, return_status=False):
     """
     Descarga y extrae el texto completo de una sentencia desde historico.tsj.gob.ve.
+    Si return_status=True, devuelve (texto, status_code).
     """
     try:
         resp = session.get(url, headers={
             "User-Agent": HEADERS["User-Agent"],
             "Accept": "text/html,application/xhtml+xml,*/*",
         }, timeout=(10, 30))
+        status_code = resp.status_code
         resp.raise_for_status()
 
         resp.encoding = resp.apparent_encoding or "latin-1"
@@ -297,11 +320,13 @@ def descargar_texto_sentencia(session, url):
         text = re.sub(r"[ \t]+", " ", text)
         text = re.sub(r"\n{3,}", "\n\n", text)
 
-        return text.strip()
+        cleaned = text.strip()
+        return (cleaned, status_code) if return_status else cleaned
 
     except requests.RequestException as e:
+        status_code = getattr(getattr(e, "response", None), "status_code", 0) or 0
         print(f"    ⚠ Error descargando sentencia: {e}")
-        return ""
+        return ("", status_code) if return_status else ""
 
 
 def extraer_ponente_de_texto(texto, ponente_api=""):
@@ -586,6 +611,114 @@ def clasificar_pauta_decision(info, texto=""):
     return "ORDINARIO", 1, 2, instruccion
 
 
+RE_NEG_NULIDAD = re.compile(
+    r"\b(?:sin lugar|inadmisible|improcedente|niega|desestima|no procede|no ha lugar)\b[^.]{0,80}\b(?:nulidad|anulaci[oó]n|casaci[oó]n\s+de\s+oficio)\b",
+    re.IGNORECASE,
+)
+RE_POS_DISPOSITIVO_NULIDAD = re.compile(
+    r"\b(?:anula\w*|nulidad\w*|anulaci[oó]n|de\s+oficio\s+con\s+lugar|casaci[oó]n\s+de\s+oficio)\b",
+    re.IGNORECASE,
+)
+RE_POS_CIERRE_NULIDAD = re.compile(
+    r"(?:esta\s+sala\s+anula|de\s+oficio\s+la\s+nulidad|decreta(?:\s+de\s+oficio)?\s+la\s+nulidad|"
+    r"declara(?:\s+de\s+oficio)?\s+la\s+nulidad|anula\s+de\s+oficio|de\s+oficio\s+anula|"
+    r"se\s+anula|acarre[oó]\s+(?:la|su)\s+nulidad|produce\s+la\s+nulidad|casaci[oó]n\s+de\s+oficio)",
+    re.IGNORECASE,
+)
+
+
+def _extraer_dispositivo_y_cierre(texto):
+    """Aísla el bloque dispositivo de la sentencia y las líneas finales de motivación previas."""
+    if not texto:
+        return "", ""
+    lines = [l.strip() for l in texto.splitlines() if l.strip()]
+    total_l = len(lines)
+    idx_final = -1
+    min_idx = max(int(total_l * 0.35), 0)
+
+    for i in range(total_l - 1, min_idx, -1):
+        lu = lines[i].upper()
+        if re.search(r"^(?:[IVXLCDM]+\s*[-.:]?\s*)?(?:DECISI[OÓ]N|DISPOSITIV[OA]|PARTE\s+DISPOSITIV[OA])$", lu):
+            idx_final = i
+            break
+
+    if idx_final == -1:
+        for i in range(total_l - 1, min_idx, -1):
+            lu = lines[i].upper()
+            if any(lu.startswith(p) for p in (
+                "POR LAS RAZONES EXPUESTAS",
+                "POR LAS RAZONES PRECEDENTEMENTE",
+                "POR LOS MOTIVOS EXPUESTOS",
+                "POR LOS MOTIVOS ANTES EXPUESTOS",
+                "ADMINISTRANDO JUSTICIA EN NOMBRE DE LA REPÚBLICA",
+            )):
+                idx_final = i
+                break
+
+    if idx_final == -1:
+        return "", texto[-2500:]
+
+    idx_fin_disp = len(lines)
+    for j in range(idx_final + 1, len(lines)):
+        lu = lines[j].upper()
+        if any(p in lu for p in ("PUBLÍQUESE", "PUBLIQUESE", "DADA, FIRMADA", "DADA FIRMADA", "VOTO SALVADO")):
+            idx_fin_disp = j
+            break
+
+    disp = " ".join(lines[idx_final:idx_fin_disp])
+    cierre_prev = " ".join(lines[max(0, idx_final - 15):idx_final])
+    return disp, cierre_prev
+
+
+def es_sentencia_de_nulidad(decision_resumen, texto=""):
+    """Determina si una sentencia declara o decreta efectivamente una nulidad."""
+    dec = (decision_resumen or "").strip()
+    disp, cierre_prev = _extraer_dispositivo_y_cierre(texto)
+    dec_clean = RE_NEG_NULIDAD.sub("", dec)
+    disp_clean = RE_NEG_NULIDAD.sub("", disp)
+    cierre_clean = RE_NEG_NULIDAD.sub("", cierre_prev)
+
+    if RE_POS_DISPOSITIVO_NULIDAD.search(dec_clean) or RE_POS_DISPOSITIVO_NULIDAD.search(disp_clean):
+        return True
+    if RE_POS_CIERRE_NULIDAD.search(cierre_clean):
+        return True
+    return False
+
+
+def clasificar_pauta_historica(info, texto=""):
+    """
+    Pauta exclusiva del modo histórico (19/01/2000 – 30/09/2026):
+      - Solo se procesan sentencias de nulidad.
+      - Se extrae como máximo UNA (1) máxima jurídica por sentencia.
+    """
+    proc = (info.get("procedimiento") or "").lower()
+    resumen = (info.get("decision_resumen") or "").lower()
+    exp = (info.get("expediente") or "").upper()
+
+    if (
+        "extradici" in proc
+        or exp.startswith("E")
+        or "extradici" in resumen
+        or "procedimiento de extradición" in (texto[:1200].lower() if texto else "")
+    ):
+        return ("EXTRADICION", 0, 0, "EXTRADICIÓN: No tomar ninguna máxima jurídica (0 máximas).")
+
+    if not texto:
+        return ("SIN_TEXTO", 0, 0, "")
+
+    if not es_sentencia_de_nulidad(info.get("decision_resumen", ""), texto):
+        return ("OMITIDA_NO_NULIDAD", 0, 0, "")
+
+    instruccion = (
+        "PAUTA OBLIGATORIA DE CANTIDAD (MODO HISTÓRICO - SENTENCIA DE NULIDAD):\n"
+        "Esta sentencia declara o decreta una NULIDAD. Debes extraer COMO MÁXIMO UNA (1) MÁXIMA JURÍDICA: "
+        "únicamente el criterio doctrinario o ratio decidendi más relevante que fundamenta la nulidad. "
+        "Si no sienta doctrina relevante o es puramente formal, devuelve lista vacía []. "
+        "BAJO NINGUNA CIRCUNSTANCIA extraigas más de una (1) máxima."
+    )
+    return ("NULIDAD_HISTORICA", 0, 1, instruccion)
+
+
 # ─── Prompt de Extracción de Máximas ─────────────────────────────────────────
 MAXIMAS_PROMPT = """Actúa como un experto en Derecho Procesal Penal venezolano.
 Estás analizando el CAPÍTULO DECISORIO de una sentencia de la Sala de Casación Penal
@@ -792,14 +925,33 @@ FRASES_INVALIDAS = [
 ]
 
 
+def _extraer_anio(fecha_str):
+    """Extrae el año de 4 dígitos desde una fecha en texto."""
+    m = re.search(r"\b(19\d{2}|20\d{2})\b", str(fecha_str or ""))
+    return m.group(1) if m else ""
+
+
+def _son_misma_sentencia(num1, fecha1, num2, fecha2):
+    """Compara identidad de sentencia por número y año (si ambos años son conocidos)."""
+    n1 = str(num1 or "").lstrip("0") or "0"
+    n2 = str(num2 or "").lstrip("0") or "0"
+    if n1 != n2:
+        return False
+    a1 = _extraer_anio(fecha1)
+    a2 = _extraer_anio(fecha2)
+    if a1 and a2:
+        return a1 == a2
+    return True
+
+
 def limpiar_y_validar_maxima(s, numero_esperado=""):
     """Normaliza y valida una máxima jurídica."""
     if not isinstance(s, dict):
         return None
 
     raw = str(s.get("numero", "")).replace(".", "").strip()
-    num = raw.lstrip("0") or "0"
-    if not num.isdigit() or num == "0":
+    num = raw.lstrip("0") or "0" if raw.isdigit() else raw
+    if not num or num == "0" or not any(ch.isdigit() for ch in num):
         return None
     if numero_esperado and num != numero_esperado:
         num = numero_esperado
@@ -904,17 +1056,19 @@ def es_misma_maxima_inter_sentencia(r_nuevo, fila_existente):
     """
     ex_id, ex_num, ex_sala, ex_fecha, ex_tema, ex_ext, ex_cit, ex_ratif = fila_existente
 
-    num_nuevo = str(r_nuevo.get("numero", "")).lstrip("0") or "0"
-    num_ex = str(ex_num).lstrip("0") or "0"
-    if num_nuevo == num_ex:
+    if _son_misma_sentencia(r_nuevo.get("numero", ""), r_nuevo.get("fecha", ""), ex_num, ex_fecha):
         return False
 
-    # 1. Mención expresa en ratificaciones: "Ratifica a Sentencia N° X"
+    num_ex = str(ex_num).lstrip("0") or "0"
+    anio_ex = _extraer_anio(ex_fecha)
+
+    # 1. Mención expresa en ratificaciones: "Ratifica a Sentencia N° X del ..."
     ratif_nueva = str(r_nuevo.get("ratificaciones", "") or "")
     if ratif_nueva:
         ratif_sin_fechas = re.sub(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b", "", ratif_nueva)
         nums_ratif = [n.lstrip("0") for n in re.findall(r"\b\d+\b", ratif_sin_fechas)]
-        if num_ex in nums_ratif:
+        anios_ratif = re.findall(r"\b(?:19\d{2}|20\d{2})\b", ratif_nueva)
+        if num_ex in nums_ratif and (not anios_ratif or not anio_ex or anio_ex in anios_ratif):
             return True
 
     # 2. Contenido citado idéntico o muy similar
@@ -943,12 +1097,13 @@ def es_misma_maxima_inter_sentencia(r_nuevo, fila_existente):
     return False
 
 
-def insert_maximas(conn, maximas, archivo_origen):
+def insert_maximas(conn, maximas, archivo_origen, modo_historico=False):
     """
     Inserta o enriquece máximas en la base de datos.
-    Aplica regla anti-duplicados entre sentencias distintas:
-    si la máxima ya existe en otra sentencia, no se inserta como fila nueva,
-    sino que se anota la ratificación en el registro original existente.
+    Aplica regla anti-duplicados entre sentencias distintas (diferenciando año):
+    si la máxima ya existe en otra sentencia, no se inserta como fila nueva;
+    si es posterior, actualiza la ratificación en el registro original, y si
+    es un criterio duplicado en revisión histórica anterior, se ignora.
     """
     cur = conn.cursor()
     ins = upd = dup = 0
@@ -958,13 +1113,16 @@ def insert_maximas(conn, maximas, archivo_origen):
         if r is None:
             continue
 
-        # ── 1) Buscar si coincide con la MISMA sentencia ──
+        # ── 1) Buscar si coincide con la MISMA sentencia (mismo número, sala y año) ──
         cur.execute(
             "SELECT id, COALESCE(tema,''), extracto, contenido_citado, fecha, "
             "COALESCE(ratificaciones,'') FROM sentencias WHERE numero=? AND sala=?",
             (r["numero"], r["sala"]),
         )
-        existentes_misma_sentencia = cur.fetchall()
+        existentes_misma_sentencia = [
+            fila for fila in cur.fetchall()
+            if _son_misma_sentencia(r["numero"], r["fecha"], r["numero"], fila[4])
+        ]
 
         coincidente = None
         for fila in existentes_misma_sentencia:
@@ -1007,10 +1165,13 @@ def insert_maximas(conn, maximas, archivo_origen):
         # ── 2) Buscar si esta máxima ya fue sentada en OTRA sentencia previa ──
         cur.execute(
             "SELECT id, numero, sala, fecha, COALESCE(tema,''), extracto, contenido_citado, "
-            "COALESCE(ratificaciones,'') FROM sentencias WHERE sala = ? AND numero != ?",
-            (r["sala"], r["numero"]),
+            "COALESCE(ratificaciones,'') FROM sentencias WHERE sala = ?",
+            (r["sala"],),
         )
-        otras_sentencias = cur.fetchall()
+        otras_sentencias = [
+            fila for fila in cur.fetchall()
+            if not _son_misma_sentencia(r["numero"], r["fecha"], fila[1], fila[3])
+        ]
 
         precedente_coincidente = None
         for fila_otra in otras_sentencias:
@@ -1019,8 +1180,17 @@ def insert_maximas(conn, maximas, archivo_origen):
                 break
 
         if precedente_coincidente is not None:
-            # Regla: NO insertar como nueva; actualizar ratificación en la sentencia original
             p_id, p_num, p_sala, p_fecha, p_tema, p_ext, p_cit, p_ratif = precedente_coincidente
+            f_nueva_dt = parse_fecha(r["fecha"])
+            f_ex_dt = parse_fecha(p_fecha)
+
+            # Si el registro existente es más reciente (típico al revisar histórico 2000-2026)
+            # o en modo histórico ya existe el criterio, ignorar el duplicado sin alterar cronología
+            if (f_nueva_dt and f_ex_dt and f_nueva_dt < f_ex_dt) or modo_historico:
+                print(f"\n      ⏭️ Criterio duplicado (ya existe en Sentencia N° {p_num} del {p_fecha}). Se ignora.")
+                dup += 1
+                continue
+
             nuevas_ratif = actualizar_ratificaciones_ratificada_por(
                 p_ratif, r["numero"], r["fecha"]
             )
@@ -1073,7 +1243,7 @@ def obtener_bloques_a_procesar(conn, archivo, total, reprocess=False):
 
 def count_sentencias(conn):
     c = conn.cursor()
-    c.execute("SELECT COUNT(*), COUNT(DISTINCT numero||'_'||sala) FROM sentencias")
+    c.execute("SELECT COUNT(*), COUNT(DISTINCT numero||'_'||sala||'_'||COALESCE(fecha,'')) FROM sentencias")
     return c.fetchone()
 
 
@@ -1095,50 +1265,178 @@ def export_csv(conn):
 
 
 # ─── Determinación Inteligente de Fechas ─────────────────────────────────────
+def _obtener_fechas_estado_bloques(conn, fecha_min=None, fecha_max=None):
+    """
+    Lee de estado_bloques las fechas con errores activos y las completadas,
+    filtradas opcionalmente al rango [fecha_min, fecha_max] para no mezclar
+    el seguimiento actual con el histórico.
+    """
+    c = conn.cursor()
+    c.execute("SELECT DISTINCT archivo FROM estado_bloques WHERE estado = 'ERROR'")
+    fechas_con_error = set()
+    for (arch,) in c.fetchall():
+        m = re.search(r"(\d{2})[-/](\d{2})[-/](\d{4})", arch or "")
+        if not m:
+            continue
+        f_str = f"{m.group(1)}/{m.group(2)}/{m.group(3)}"
+        f_dt = parse_fecha(f_str)
+        if not f_dt:
+            continue
+        if fecha_min and f_dt < fecha_min:
+            continue
+        if fecha_max and f_dt > fecha_max:
+            continue
+        fechas_con_error.add(f_str)
+
+    c.execute("SELECT archivo, min(estado) FROM estado_bloques GROUP BY archivo")
+    completadas_por_fecha = {}
+    for arch, min_est in c.fetchall():
+        if min_est != "EXITOSO":
+            continue
+        m = re.search(r"(\d{2})[-/](\d{2})[-/](\d{4})", arch or "")
+        if not m:
+            continue
+        f_str = f"{m.group(1)}/{m.group(2)}/{m.group(3)}"
+        f_dt = parse_fecha(f_str)
+        if not f_dt:
+            continue
+        if fecha_min and f_dt < fecha_min:
+            continue
+        if fecha_max and f_dt > fecha_max:
+            continue
+        completadas_por_fecha[f_str] = completadas_por_fecha.get(f_str, 0) + 1
+
+    return fechas_con_error, completadas_por_fecha
+
+
+def determinar_dias_historicos(conn, session):
+    """
+    Determina los días pendientes del modo histórico (19/01/2000 – 30/09/2026)
+    usando su propio cursor paralelo (`ultima_fecha_historica_003`).
+    Retorna (dias_a_procesar, hay_mas_despues).
+    """
+    if obtener_control(conn, CLAVE_HIST_COMPLETADO) == "1":
+        print("\n✨ La revisión histórica de nulidades (19/01/2000 – 30/09/2026) ya fue completada.")
+        return [], False
+
+    ultima_hist_str = obtener_control(conn, CLAVE_CONTROL_HIST)
+    ultima_hist_dt = parse_fecha(ultima_hist_str) if ultima_hist_str else None
+    fechas_con_error_hist, _ = _obtener_fechas_estado_bloques(conn, FECHA_HIST_INICIO, FECHA_HIST_FIN)
+
+    anio_inicio = FECHA_HIST_INICIO.year
+    if ultima_hist_dt:
+        anio_inicio = max(FECHA_HIST_INICIO.year, ultima_hist_dt.year)
+    if fechas_con_error_hist:
+        min_err_year = min(parse_fecha(f).year for f in fechas_con_error_hist if parse_fecha(f))
+        anio_inicio = min(anio_inicio, max(FECHA_HIST_INICIO.year, min_err_year))
+
+    print("\n" + "=" * 60)
+    print("🕰️  MODO HISTÓRICO DE RESPALDO (SOLO NULIDADES)")
+    print(f"   Rango histórico: 19/01/2000 al 30/09/2026")
+    print(f"   Cursor histórico actual: {ultima_hist_str or 'Inicio (19/01/2000)'}")
+    print("   Regla: Solo sentencias de nulidad · Máximo 1 máxima/sentencia")
+    if fechas_con_error_hist:
+        print(f"   🔄 Fechas históricas con error previo: {', '.join(sorted(fechas_con_error_hist))}")
+    print("=" * 60)
+
+    dias_hist_dict = {}
+    hay_mas_despues = False
+
+    for ano in range(anio_inicio, FECHA_HIST_FIN.year + 1):
+        dias_ano = obtener_dias_publicados(session, SALA_ID, str(ano))
+        for d in dias_ano:
+            f_dt = d["fecha_dt"]
+            if f_dt < FECHA_HIST_INICIO or f_dt > FECHA_HIST_FIN:
+                continue
+            f = d["fecha"]
+            if f in fechas_con_error_hist or ultima_hist_dt is None or f_dt > ultima_hist_dt:
+                dias_hist_dict[f] = d
+
+        if len(dias_hist_dict) >= HIST_MAX_DIAS_POR_RUN:
+            if ano < FECHA_HIST_FIN.year:
+                hay_mas_despues = True
+            break
+
+    dias_finales = sorted(dias_hist_dict.values(), key=lambda x: x["fecha_dt"])
+    if len(dias_finales) > HIST_MAX_DIAS_POR_RUN:
+        dias_finales = dias_finales[:HIST_MAX_DIAS_POR_RUN]
+        hay_mas_despues = True
+
+    if not dias_finales:
+        print("\n✨ Revisión histórica (19/01/2000 – 30/09/2026) completada sin fechas pendientes.")
+        return [], False
+
+    print(f"\n📋 Días históricos en cola para esta ejecución ({len(dias_finales)} fecha(s)):")
+    for d in dias_finales[:10]:
+        tag = " (🔄 reintentando)" if d["fecha"] in fechas_con_error_hist else ""
+        print(f"   • {d['fecha']} ({d['cuantas']} sentencias){tag}")
+    if len(dias_finales) > 10:
+        print(f"   ... y {len(dias_finales) - 10} fecha(s) más (hasta {dias_finales[-1]['fecha']}).")
+
+    return dias_finales, hay_mas_despues
+
+
 def determinar_dias_a_procesar(conn, session, args):
     """
-    Determina qué fechas se deben procesar según argumentos o seguimiento incremental:
-      - Si se pasa --reset-fecha: borra el registro previo.
-      - Si se pasa --fecha DD/MM/AAAA: procesa únicamente esa fecha.
-      - Si se pasa --mes MM: procesa ese mes completo.
-      - Si se pasa --desde DD/MM/AAAA: procesa desde esa fecha en adelante.
-      - Si se pasa --todas: procesa todo el año publicado.
-      - MODO AUTOMÁTICO (sin argumentos de fecha):
-          * Si nunca se ha extraído: procesa todo OCTUBRE 2026.
-          * Si ya se extrajo antes: consulta el TSJ y procesa SOLO fechas
-            posteriores a la última fecha registrada.
+    Determina qué fechas se deben procesar según argumentos o seguimiento dual:
+      - Modo actual (desde 01/10/2026 en adelante): usa `ultima_fecha_procesada_003`.
+      - Si no hay nuevas sentencias ni errores pendientes en el modo actual,
+        activa automáticamente el modo histórico (19/01/2000 – 30/09/2026)
+        usando su propio cursor `ultima_fecha_historica_003`.
+    Retorna: (dias_a_procesar, modo_historico, hay_mas_historico)
     """
-    clave_control = f"ultima_fecha_procesada_{SALA_ID}"
-
-    # 1) Manejo de --reset-fecha
+    # 1) Manejo de reinicios de control
     if "--reset-fecha" in args:
-        conn.cursor().execute("DELETE FROM control_web WHERE clave = ?", (clave_control,))
+        conn.cursor().execute("DELETE FROM control_web WHERE clave = ?", (CLAVE_CONTROL_ACTUAL,))
         conn.commit()
-        print("🔄 Se ha reiniciado el registro de última fecha procesada.")
+        print("🔄 Se ha reiniciado el registro de última fecha actual.")
 
+    if "--reset-historico" in args:
+        conn.cursor().execute(
+            "DELETE FROM control_web WHERE clave IN (?, ?)",
+            (CLAVE_CONTROL_HIST, CLAVE_HIST_COMPLETADO),
+        )
+        conn.commit()
+        print("🔄 Se ha reiniciado el registro de fecha histórica.")
+
+    # Modo histórico forzado manualmente
+    if "--historico" in args:
+        dias_hist, hay_mas_hist = determinar_dias_historicos(conn, session)
+        return dias_hist, True, hay_mas_hist
+
+    anio_tope = max(int(ANO_DEFAULT), date.today().year)
+    dias_publicados = []
     print("\n🌐 Consultando calendario de sentencias publicadas en el TSJ...")
-    dias_publicados = obtener_dias_publicados(session, SALA_ID, ANO_DEFAULT)
+    for ano in range(int(ANO_DEFAULT), anio_tope + 1):
+        dias_ano = obtener_dias_publicados(session, SALA_ID, str(ano))
+        dias_publicados.extend(dias_ano)
+
+    dias_publicados.sort(key=lambda x: x["fecha_dt"])
+
     if not dias_publicados:
         print("⚠  No se pudieron obtener las fechas publicadas desde la API del TSJ.")
-        return []
+        return [], False, False
 
-    print(f"📅 El portal del TSJ registra {len(dias_publicados)} días con sentencias en {ANO_DEFAULT} para la {SALA_NOMBRE}.")
+    print(f"📅 El portal del TSJ registra {len(dias_publicados)} días con sentencias desde {ANO_DEFAULT} para la {SALA_NOMBRE}.")
 
     # 2) Argumento explícito: --fecha DD/MM/AAAA
     if "--fecha" in args:
         idx = args.index("--fecha")
         if idx + 1 < len(args):
             f_target = args[idx + 1].strip()
-            dias = [d for d in dias_publicados if d["fecha"] == f_target]
+            f_dt = parse_fecha(f_target)
+            if f_dt and str(f_dt.year) != ANO_DEFAULT:
+                dias_target_ano = obtener_dias_publicados(session, SALA_ID, str(f_dt.year))
+                dias = [d for d in dias_target_ano if d["fecha"] == f_target]
+            else:
+                dias = [d for d in dias_publicados if d["fecha"] == f_target]
             if dias:
                 print(f"🎯 Modo fecha específica: {f_target}")
-                return dias
-            else:
-                print(f"⚠ La fecha {f_target} no tiene sentencias registradas en la API del TSJ.")
-                f_dt = parse_fecha(f_target)
-                if f_dt:
-                    return [{"fecha": f_target, "fecha_dt": f_dt, "cuantas": 0, "mes_nombre": "", "mes_num": f_dt.month, "dia": str(f_dt.day)}]
-                return []
+                return dias, False, False
+            print(f"⚠ La fecha {f_target} no tiene sentencias registradas en la API del TSJ.")
+            if f_dt:
+                return ([{"fecha": f_target, "fecha_dt": f_dt, "cuantas": 0, "mes_nombre": "", "mes_num": f_dt.month, "dia": str(f_dt.day)}], False, False)
+            return [], False, False
 
     # 3) Argumento explícito: --mes MM / nombre
     if "--mes" in args:
@@ -1149,10 +1447,9 @@ def determinar_dias_a_procesar(conn, session, args):
             if m_num:
                 dias = [d for d in dias_publicados if d["mes_num"] == m_num]
                 print(f"🎯 Modo mes específico: Mes {m_num} ({len(dias)} días encontrados)")
-                return dias
-            else:
-                print(f"⚠ Mes no reconocido: {m_arg}")
-                return []
+                return dias, False, False
+            print(f"⚠ Mes no reconocido: {m_arg}")
+            return [], False, False
 
     # 4) Argumento explícito: --desde DD/MM/AAAA
     if "--desde" in args:
@@ -1163,90 +1460,67 @@ def determinar_dias_a_procesar(conn, session, args):
             if d_dt:
                 dias = [d for d in dias_publicados if d["fecha_dt"] >= d_dt]
                 print(f"🎯 Modo rango: Desde {d_str} en adelante ({len(dias)} días a procesar)")
-                return dias
+                return dias, False, False
 
     # 5) Argumento explícito: --todas
     if "--todas" in args or "--todo-el-ano" in args:
-        print(f"🎯 Modo completo: Todas las fechas de {ANO_DEFAULT} ({len(dias_publicados)} días)")
-        return dias_publicados
+        print(f"🎯 Modo completo: Todas las fechas desde {ANO_DEFAULT} ({len(dias_publicados)} días)")
+        return dias_publicados, False, False
 
-    # 6) MODO AUTOMÁTICO (por defecto) con Autorrecuperación Inteligente
-    ultima_fecha_str = obtener_control(conn, clave_control)
-
-    # Identificar fechas con bloques o sentencias pendientes por error en estado_bloques
-    c = conn.cursor()
-    c.execute("SELECT DISTINCT archivo FROM estado_bloques WHERE estado = 'ERROR'")
-    archivos_error = [r[0] for r in c.fetchall()]
-    fechas_con_error = set()
-    for arch in archivos_error:
-        m = re.search(r"(\d{2})[-/](\d{2})[-/](\d{4})", arch)
-        if m:
-            fechas_con_error.add(f"{m.group(1)}/{m.group(2)}/{m.group(3)}")
-
-    # Detectar fechas que quedaron incompletas (menos sentencias completadas que publicadas)
-    c.execute("""
-        SELECT archivo, min(estado)
-        FROM estado_bloques
-        GROUP BY archivo
-    """)
-    completadas_por_fecha = {}
-    for arch, min_est in c.fetchall():
-        if min_est == "EXITOSO":
-            m = re.search(r"(\d{2})[-/](\d{2})[-/](\d{4})", arch)
-            if m:
-                f = f"{m.group(1)}/{m.group(2)}/{m.group(3)}"
-                completadas_por_fecha[f] = completadas_por_fecha.get(f, 0) + 1
+    # 6) MODO AUTOMÁTICO (Actual >= Oct 2026) con transición a Histórico si está al día
+    ultima_fecha_str = obtener_control(conn, CLAVE_CONTROL_ACTUAL)
+    fechas_con_error, completadas_por_fecha = _obtener_fechas_estado_bloques(
+        conn, fecha_min=FECHA_ACTUAL_INICIO
+    )
 
     dias_a_procesar_dict = {}
 
-    # A. Fechas con errores activos que deben reintentarse prioritariamente
+    # A. Fechas actuales (>= Oct 2026) con errores activos
     for d in dias_publicados:
-        f = d["fecha"]
-        if f in fechas_con_error:
-            dias_a_procesar_dict[f] = d
+        if d["fecha_dt"] >= FECHA_ACTUAL_INICIO and d["fecha"] in fechas_con_error:
+            dias_a_procesar_dict[d["fecha"]] = d
 
-    # B. Fechas nuevas o iniciales
+    # B. Fechas nuevas o iniciales (>= Oct 2026)
     if not ultima_fecha_str:
-        # PRIMERA EJECUCIÓN: Procesar todas las sentencias de Octubre 2026
-        dias_octubre = [d for d in dias_publicados if d["mes_num"] == 10]
+        dias_octubre = [d for d in dias_publicados if d["fecha_dt"] >= FECHA_ACTUAL_INICIO and d["mes_num"] == 10]
         for d in dias_octubre:
             dias_a_procesar_dict[d["fecha"]] = d
         print("\n" + "=" * 60)
-        print("📌 PRIMERA EJECUCIÓN DETECTADA")
+        print("📌 PRIMERA EJECUCIÓN DETECTADA (MODO ACTUAL)")
         print(f"   Objetivo inicial: Todas las sentencias de OCTUBRE {ANO_DEFAULT}")
         print(f"   Días encontrados: {len(dias_a_procesar_dict)} fechas")
         print("=" * 60)
     else:
         ultima_dt = parse_fecha(ultima_fecha_str)
         for d in dias_publicados:
+            if d["fecha_dt"] < FECHA_ACTUAL_INICIO:
+                continue
             f = d["fecha"]
-            # Días posteriores a la última procesada
             if d["fecha_dt"] > ultima_dt:
                 dias_a_procesar_dict[f] = d
-            # O el mismo día si quedó incompleto
             elif d["fecha_dt"] == ultima_dt and f in completadas_por_fecha and completadas_por_fecha[f] < d.get("cuantas", 0):
                 dias_a_procesar_dict[f] = d
 
         print("\n" + "=" * 60)
-        print("📌 MODO INCREMENTAL INTELIGENTE CON AUTORRECUPERACIÓN")
-        print(f"   Última fecha completada registrada en BD: {ultima_fecha_str}")
+        print("📌 MODO INCREMENTAL ACTUAL (DESDE OCTUBRE 2026)")
+        print(f"   Última fecha actual completada: {ultima_fecha_str}")
         if fechas_con_error:
-            print(f"   🔄 Días con sentencias pendientes por reintentar: {', '.join(sorted(fechas_con_error))}")
+            print(f"   🔄 Días actuales pendientes por reintentar: {', '.join(sorted(fechas_con_error))}")
         print("=" * 60)
 
-    # Ordenar cronológicamente
     dias_finales = sorted(dias_a_procesar_dict.values(), key=lambda x: x["fecha_dt"])
 
-    if not dias_finales:
-        print(f"\n✨ ¡Estás al día! No se encontraron fechas pendientes ni nuevas publicaciones posteriores al {ultima_fecha_str}.")
-        return []
+    if dias_finales:
+        print(f"\n📋 Días actuales a procesar en esta ejecución ({len(dias_finales)} fecha(s)):")
+        for d in dias_finales:
+            extra_info = " (🔄 reintentando pendientes)" if (d["fecha"] in fechas_con_error or (d["fecha"] in completadas_por_fecha and completadas_por_fecha[d["fecha"]] < d.get("cuantas", 0))) else " (🆕 nueva fecha)"
+            print(f"   • {d['fecha']} ({d['cuantas']} sentencias){extra_info}")
+        return dias_finales, False, False
 
-    print(f"\n📋 Días a procesar en esta ejecución ({len(dias_finales)} fecha(s)):")
-    for d in dias_finales:
-        extra_info = " (🔄 reintentando pendientes)" if (d["fecha"] in fechas_con_error or (d["fecha"] in completadas_por_fecha and completadas_por_fecha[d["fecha"]] < d.get("cuantas", 0))) else " (🆕 nueva fecha)"
-        print(f"   • {d['fecha']} ({d['cuantas']} sentencias){extra_info}")
-
-    return dias_finales
+    print(f"\n✨ ¡Estás al día en sentencias nuevas! No hay publicaciones posteriores al {ultima_fecha_str}.")
+    print("   Pasando automáticamente a la revisión histórica de nulidades (19/01/2000 – 30/09/2026)...")
+    dias_hist, hay_mas_hist = determinar_dias_historicos(conn, session)
+    return dias_hist, True, hay_mas_hist
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -1264,10 +1538,12 @@ def main():
     session = requests.Session()
     session.verify = False
 
-    # 1) Determinar días a procesar
-    dias_a_procesar = determinar_dias_a_procesar(conn, session, args)
+    # 1) Determinar días a procesar (modo actual o respaldo histórico de nulidades)
+    dias_a_procesar, modo_historico, hay_mas_historico = determinar_dias_a_procesar(conn, session, args)
 
     if not dias_a_procesar:
+        if modo_historico and not hay_mas_historico and obtener_control(conn, CLAVE_HIST_COMPLETADO) != "1":
+            guardar_control(conn, CLAVE_HIST_COMPLETADO, "1")
         conn.close()
         return
 
@@ -1287,23 +1563,43 @@ def main():
     total_general_upd = 0
     total_general_dup = 0
     total_sentencias_procesadas = 0
+    dias_completados_en_run = 0
 
-    clave_control = f"ultima_fecha_procesada_{SALA_ID}"
+    clave_control = CLAVE_CONTROL_HIST if modo_historico else CLAVE_CONTROL_ACTUAL
     limite_diario_alcanzado = False
+    tiempo_limite_alcanzado = False
+    bloqueo_avance_control = False
+    start_time = time.monotonic()
 
     for dia_idx, dia_info in enumerate(dias_a_procesar, 1):
-        if limite_diario_alcanzado:
+        if limite_diario_alcanzado or tiempo_limite_alcanzado:
+            break
+        if modo_historico and (time.monotonic() - start_time) / 60.0 >= HIST_MAX_MINUTOS_POR_RUN:
+            print(f"\n⏱️  Tope preventivo de tiempo ({HIST_MAX_MINUTOS_POR_RUN} min) alcanzado. Guardando avance histórico...")
+            tiempo_limite_alcanzado = True
             break
 
         fecha_str = dia_info["fecha"]
+        modo_etiqueta = "HISTÓRICO NULIDADES" if modo_historico else "ACTUAL"
         print(f"\n{'━' * 60}")
-        print(f"📅 [{dia_idx}/{len(dias_a_procesar)}] PROCESANDO DÍA: {fecha_str}")
+        print(f"📅 [{dia_idx}/{len(dias_a_procesar)}] ({modo_etiqueta}) PROCESANDO DÍA: {fecha_str}")
         print(f"   Decisiones esperadas en portal: {dia_info['cuantas']}")
         print(f"{'━' * 60}")
 
-        sentencias = listar_sentencias_por_fecha(session, fecha_str, SALA_ID)
+        sentencias, api_ok = listar_sentencias_por_fecha(session, fecha_str, SALA_ID, return_ok=True)
+        if not api_ok:
+            print(f"   ⚠ No se pudo consultar la lista de sentencias para {fecha_str}.")
+            bloqueo_avance_control = True
+            continue
         if not sentencias:
-            print(f"   ⚠ No se pudieron descargar las sentencias para {fecha_str}.")
+            print(f"   ℹ Sin documentos descargables válidos para {fecha_str}.")
+            if not bloqueo_avance_control:
+                ultima_guardada = obtener_control(conn, clave_control)
+                ultima_guardada_dt = parse_fecha(ultima_guardada) if ultima_guardada else None
+                if not ultima_guardada_dt or dia_info["fecha_dt"] > ultima_guardada_dt:
+                    guardar_control(conn, clave_control, fecha_str)
+                    print(f"   📌 Control ({clave_control}) actualizado = {fecha_str}")
+            dias_completados_en_run += 1
             continue
 
         print(f"   📥 Sentencias listadas para este día: {len(sentencias)}")
@@ -1311,8 +1607,14 @@ def main():
         hubo_errores_graves_en_dia = False
 
         for idx, info in enumerate(sentencias, 1):
-            if limite_diario_alcanzado:
+            if limite_diario_alcanzado or tiempo_limite_alcanzado:
                 break
+            if modo_historico and (time.monotonic() - start_time) / 60.0 >= HIST_MAX_MINUTOS_POR_RUN:
+                print(f"\n⏱️  Tope preventivo de tiempo ({HIST_MAX_MINUTOS_POR_RUN} min) alcanzado a mitad del día.")
+                tiempo_limite_alcanzado = True
+                hubo_errores_graves_en_dia = True
+                break
+
             numero = info["numero"]
             url = info["url"]
             ponente = info["ponente"]
@@ -1334,10 +1636,15 @@ def main():
 
             # Descargar texto
             print("     📥 Descargando texto...", end=" ", flush=True)
-            texto = descargar_texto_sentencia(session, url)
+            texto, status_code = descargar_texto_sentencia(session, url, return_status=True)
             if not texto:
-                print("✘ No se pudo descargar", flush=True)
-                hubo_errores_graves_en_dia = True
+                if status_code == 404:
+                    print("⚠ HTML no disponible (404), se omite.", flush=True)
+                    guardar_estado_bloque(conn, archivo_id, 1, 1, "EXITOSO", 0, "Omitida: HTML 404")
+                    total_sentencias_procesadas += 1
+                else:
+                    print("✘ No se pudo descargar", flush=True)
+                    hubo_errores_graves_en_dia = True
                 continue
             print(f"✔ ({len(texto):,} caracteres)", flush=True)
 
@@ -1346,13 +1653,26 @@ def main():
                 if ponente:
                     print(f"     👤 Ponente detectado: {ponente}")
 
-            # 2. Clasificar tipo de decisión y pauta de máximas
-            categoria, min_m, max_m, instruccion_pauta = clasificar_pauta_decision(info, texto)
-            if categoria == "EXTRADICION":
-                print("     🚫 Decisión de Extradición: se omite la extracción según directriz (0 máximas).")
-                guardar_estado_bloque(conn, archivo_id, 1, 1, "EXITOSO", 0, "Omitida: Extradición")
-                total_sentencias_procesadas += 1
-                continue
+            # 2. Clasificar tipo de decisión y pauta de máximas según modo
+            if modo_historico:
+                categoria, min_m, max_m, instruccion_pauta = clasificar_pauta_historica(info, texto)
+                if categoria == "EXTRADICION":
+                    print("     🚫 Decisión de Extradición: se omite (0 máximas).")
+                    guardar_estado_bloque(conn, archivo_id, 1, 1, "EXITOSO", 0, "Omitida: Extradición")
+                    total_sentencias_procesadas += 1
+                    continue
+                if categoria == "OMITIDA_NO_NULIDAD":
+                    print("     ⏭️  No es sentencia de nulidad: se omite (modo histórico).")
+                    guardar_estado_bloque(conn, archivo_id, 1, 1, "EXITOSO", 0, "Omitida: No es nulidad")
+                    total_sentencias_procesadas += 1
+                    continue
+            else:
+                categoria, min_m, max_m, instruccion_pauta = clasificar_pauta_decision(info, texto)
+                if categoria == "EXTRADICION":
+                    print("     🚫 Decisión de Extradición: se omite la extracción según directriz (0 máximas).")
+                    guardar_estado_bloque(conn, archivo_id, 1, 1, "EXITOSO", 0, "Omitida: Extradición")
+                    total_sentencias_procesadas += 1
+                    continue
 
             print(f"     ⚖️  Tipo de fallo: {categoria} (Pauta: {min_m} a {max_m} máximas)")
 
@@ -1374,7 +1694,6 @@ def main():
             maximas_sentencia = []
             bloques_error = []
             for count, c_num in enumerate(pendientes, 1):
-                # Verificar si ya se alcanzó el tope para esta decisión (ej: máx 1 para inadmisible/desestimado)
                 if max_m > 0 and len(maximas_sentencia) >= max_m:
                     print(f"     ⏩ Cuota alcanzada ({len(maximas_sentencia)}/{max_m} máximas). Omitiendo bloque {c_num}.", flush=True)
                     guardar_estado_bloque(conn, archivo_id, c_num, total_chunks, "EXITOSO", 0, "Cuota alcanzada")
@@ -1402,7 +1721,8 @@ def main():
                     if maximas:
                         for m in maximas:
                             m["numero"] = numero
-                        i, u, d = insert_maximas(conn, maximas, archivo_id)
+                            m["fecha"] = fecha_str
+                        i, u, d = insert_maximas(conn, maximas, archivo_id, modo_historico=modo_historico)
                         total_general_ins += i
                         total_general_upd += u
                         total_general_dup += d
@@ -1414,7 +1734,7 @@ def main():
 
                 time.sleep(2)
 
-            if limite_diario_alcanzado:
+            if limite_diario_alcanzado or tiempo_limite_alcanzado:
                 total_sentencias_procesadas += 1
                 break
 
@@ -1447,7 +1767,8 @@ def main():
                         if maximas:
                             for m in maximas:
                                 m["numero"] = numero
-                            i, u, d = insert_maximas(conn, maximas, archivo_id)
+                                m["fecha"] = fecha_str
+                            i, u, d = insert_maximas(conn, maximas, archivo_id, modo_historico=modo_historico)
                             total_general_ins += i
                             total_general_upd += u
                             total_general_dup += d
@@ -1469,17 +1790,33 @@ def main():
         )
         errores_restantes = c.fetchone()[0]
 
-        if errores_restantes == 0 and not hubo_errores_graves_en_dia and not limite_diario_alcanzado:
-            ultima_guardada = obtener_control(conn, clave_control)
-            ultima_guardada_dt = parse_fecha(ultima_guardada) if ultima_guardada else None
-            fecha_actual_dt = dia_info["fecha_dt"]
+        if errores_restantes == 0 and not hubo_errores_graves_en_dia and not limite_diario_alcanzado and not tiempo_limite_alcanzado:
+            if not bloqueo_avance_control:
+                ultima_guardada = obtener_control(conn, clave_control)
+                ultima_guardada_dt = parse_fecha(ultima_guardada) if ultima_guardada else None
+                fecha_actual_dt = dia_info["fecha_dt"]
 
-            if not ultima_guardada_dt or fecha_actual_dt > ultima_guardada_dt:
-                guardar_control(conn, clave_control, fecha_str)
-                print(f"\n  📌 Control actualizado: última fecha registrada = {fecha_str}")
+                if not ultima_guardada_dt or fecha_actual_dt > ultima_guardada_dt:
+                    guardar_control(conn, clave_control, fecha_str)
+                    print(f"\n  📌 Control ({clave_control}) actualizado: última fecha registrada = {fecha_str}")
+            else:
+                print(f"\n  ⏸️  Control ({clave_control}) retenido porque un día previo en esta ejecución falló al consultar la API.")
+            dias_completados_en_run += 1
         else:
-            print(f"\n  ⚠️  El día {fecha_str} tiene {errores_restantes} bloque(s) con error no resueltos.")
-            print("     El control de fecha NO avanza para asegurar su revisión en la próxima ejecución.")
+            bloqueo_avance_control = True
+            print(f"\n  ⚠️  El día {fecha_str} tiene pendientes o se detuvo antes de concluir.")
+            print(f"     El control ({clave_control}) NO avanza para retomarlo en la próxima ejecución.")
+
+    if (
+        modo_historico
+        and not hay_mas_historico
+        and not limite_diario_alcanzado
+        and not tiempo_limite_alcanzado
+        and not bloqueo_avance_control
+        and dias_completados_en_run == len(dias_a_procesar)
+    ):
+        guardar_control(conn, CLAVE_HIST_COMPLETADO, "1")
+        print("\n🏁 Revisión histórica (19/01/2000 – 30/09/2026) marcada como completada.")
 
     if limite_diario_alcanzado:
         print("\n" + "=" * 60)
@@ -1490,13 +1827,20 @@ def main():
         print("   en la próxima ejecución programada (a las 7:00 PM).")
         print("=" * 60)
         conn.commit()
+    elif tiempo_limite_alcanzado:
+        print("\n" + "=" * 60)
+        print("⏱️  CIERRE PREVENTIVO POR TIEMPO DE EJECUCIÓN")
+        print("   Todo el progreso histórico completado hasta aquí quedó guardado.")
+        print("   Se continuará automáticamente desde la siguiente fecha en la próxima ejecución.")
+        print("=" * 60)
+        conn.commit()
 
     # 4) Resumen final
     total_ext, sent_unicas = count_sentencias(conn)
     print(f"\n{'=' * 60}")
-    print("  RESUMEN DE EJECUCIÓN WEB")
+    print(f"  RESUMEN DE EJECUCIÓN WEB ({'HISTÓRICO NULIDADES' if modo_historico else 'ACTUAL'})")
     print(f"{'=' * 60}")
-    print(f"  📅 Días procesados:            {len(dias_a_procesar)}")
+    print(f"  📅 Días procesados:            {dias_completados_en_run}/{len(dias_a_procesar)}")
     print(f"  📄 Sentencias analizadas:      {total_sentencias_procesadas}")
     print(f"  ✅ Máximas nuevas añadidas:    {total_general_ins}")
     print(f"  📝 Máximas enriquecidas:       {total_general_upd}")
