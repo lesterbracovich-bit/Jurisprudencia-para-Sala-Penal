@@ -1,0 +1,47 @@
+name: Enlazador Oficial de Sentencias TSJ
+
+on:
+  workflow_dispatch:
+    inputs:
+      reintentar_no_encontrados:
+        description: "Reintentar sentencias marcadas antes como no encontradas (no repite las ya enlazadas)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  enlazar-sentencias:
+    runs-on: self-hosted
+    timeout-minutes: 60
+
+    steps:
+      - name: 1. Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: 2. Buscar y guardar enlaces oficiales del TSJ
+        shell: cmd
+        env:
+          PYTHONIOENCODING: utf-8
+          EXTRA_ARGS: ${{ inputs.reintentar_no_encontrados && '--reintentar-no-encontrados' || '' }}
+        run: |
+          if exist "C:\Users\Usuario\AppData\Local\Python\pythoncore-3.15-64\python.exe" (
+            set "PY=C:\Users\Usuario\AppData\Local\Python\pythoncore-3.15-64\python.exe"
+          ) else if exist "C:\Users\Usuario\AppData\Local\Programs\Python\Python311\python.exe" (
+            set "PY=C:\Users\Usuario\AppData\Local\Programs\Python\Python311\python.exe"
+          ) else (
+            set "PY=python"
+          )
+          "%PY%" -u enlazador_tsj.py %EXTRA_ARGS%
+
+      - name: 3. Guardar cambios en GitHub
+        if: always()
+        shell: cmd
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add jurisprudencia_ia.db
+          if exist reporte_jurisprudencia.csv git add reporte_jurisprudencia.csv
+          git diff --staged --quiet || (git commit -m "🔗 Actualización automática de enlaces TSJ [skip ci]" && git pull --rebase origin main && git push)
