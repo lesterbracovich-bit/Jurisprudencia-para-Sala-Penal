@@ -242,12 +242,58 @@ def _buscar_en_sala(session, cache_listas, cache_urls, fecha_tsj, sala_id, num_n
     return "", True
 
 
+# Correcciones y eliminaciones puntuales idempotentes solicitadas sobre registros históricos
+_ELIMINACIONES_SENTENCIAS = (
+    ("1309", "Sala Constitucional", "17/06/2005"),
+    ("480", "Sala de Casación Penal", "17/11/2024"),
+    ("275", "Sala de Casación Penal", "19/07/2018"),
+)
+
+_CORRECCIONES_SENTENCIAS = (
+    # (num_actual, sala, fecha_actual) -> (num_nuevo, fecha_nueva)
+    ("252", "Sala de Casación Penal", "03/07/2016", "252", "04/07/2016"),
+    ("353", "Sala de Casación Penal", "12/11/2014", "353", "13/11/2014"),
+    ("257", "Sala de Casación Penal", "14/07/2020", "24", "03/07/2020"),
+    ("120", "Sala Constitucional", "25/04/2000", "241", "25/04/2000"),
+    ("165", "Sala de Casación Penal", "27/04/2009", "165", "28/04/2009"),
+)
+
+
+def aplicar_correcciones_puntuales(conn):
+    """Aplica de forma idempotente eliminaciones y correcciones de número/fecha."""
+    cur = conn.cursor()
+    eliminadas = 0
+    corregidas = 0
+
+    for num, sala, fecha in _ELIMINACIONES_SENTENCIAS:
+        cur.execute(
+            "DELETE FROM sentencias WHERE numero = ? AND sala = ? AND fecha = ?",
+            (num, sala, fecha),
+        )
+        eliminadas += cur.rowcount
+
+    for num_old, sala, fecha_old, num_new, fecha_new in _CORRECCIONES_SENTENCIAS:
+        cur.execute(
+            "UPDATE sentencias "
+            "SET numero = ?, fecha = ?, enlace = '', enlace_estado = '' "
+            "WHERE numero = ? AND sala = ? AND fecha = ?",
+            (num_new, fecha_new, num_old, sala, fecha_old),
+        )
+        corregidas += cur.rowcount
+
+    if eliminadas or corregidas:
+        conn.commit()
+        print(f"🧹 Correcciones puntuales aplicadas: {corregidas} corregida(s), {eliminadas} eliminada(s).")
+    return corregidas, eliminadas
+
+
 def enlazar_sentencias_pendientes(conn, session, reintentar_no_encontrados=False):
     """
     Busca enlaces oficiales del TSJ solo para las sentencias pendientes de revisión.
     Retorna dict con estadísticas de la ejecución.
     """
     asegurar_columnas_enlace(conn)
+    aplicar_correcciones_puntuales(conn)
     copiados_local = _sincronizar_enlaces_locales(conn)
 
     cur = conn.cursor()
