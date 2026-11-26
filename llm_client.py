@@ -35,6 +35,7 @@ OPENROUTER_KEY_URL = f"{OPENROUTER_BASE_URL}/key"
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 NVIDIA_CHAT_URL = f"{NVIDIA_BASE_URL}/chat/completions"
 NVIDIA_MODELS_URL = f"{NVIDIA_BASE_URL}/models"
+NVIDIA_STREAM_TIMEOUT_SECONDS = 75.0
 
 # Modelos Gemini en orden de preferencia (Google AI Studio)
 PREFERRED_GEMINI_MODELS = [
@@ -62,13 +63,14 @@ PREFERRED_OPENROUTER_MODELS = [
 
 # Modelos en NVIDIA NIM (build.nvidia.com) adecuados para análisis jurídico en español + JSON
 PREFERRED_NVIDIA_MODELS = [
-    "mistralai/mistral-large-4-1t-a52b",
     "nvidia/nemotron-3-ultra-550b-a55b",
-    "moonshotai/kimi-k3.1-pro",
+    "nvidia/nemotron-3.5-lightning-30b-a3b",
     "z-ai/glm-5.3-flash",
     "minimaxai/minimax-m3.1-flash",
-    "nvidia/nemotron-3.5-super-vl-120b-a12b",
     "google/gemma-3-12b-it",
+    "nvidia/nemotron-3.5-super-vl-120b-a12b",
+    "moonshotai/kimi-k3.1-pro",
+    "mistralai/mistral-large-4-1t-a52b",
 ]
 
 PLACEHOLDER_KEYS = {
@@ -389,9 +391,15 @@ class MultiProviderClient:
         """Ejecuta una petición HTTP usando el almacén de certificados del sistema (Windows/Linux)."""
         data = json.dumps(payload).encode("utf-8") if payload is not None else None
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        is_stream = bool(payload and payload.get("stream"))
         try:
             with urllib.request.urlopen(req, timeout=timeout, context=self._ssl_ctx) as resp:
-                body = resp.read().decode("utf-8", errors="replace")
+                if is_stream:
+                    # Leer línea a línea evita timeouts del gateway proxy y reinicia el timeout por chunk
+                    chunks = [raw_line.decode("utf-8", errors="replace") for raw_line in resp]
+                    body = "".join(chunks)
+                else:
+                    body = resp.read().decode("utf-8", errors="replace")
                 return resp.status, body, dict(resp.headers)
         except urllib.error.HTTPError as err:
             body = err.read().decode("utf-8", errors="replace")
@@ -416,16 +424,50 @@ class MultiProviderClient:
         return err_msg
 
     @staticmethod
-    def _extract_openai_content_from_json(data: dict[str, Any]) -> str:
+    def _extract_content_text(content: Any) -> str:
+        if isinstance(content, list):
+            return "".join(p.get("text", "") for p in content if isinstance(p, dict))
+        return content or ""
+
+    @classmethod
+    def _extract_openai_content_from_json(cls, data: dict[str, Any]) -> str:
         choices = data.get("choices") or []
         if not choices:
             return ""
         msg = choices[0].get("message") or {}
-        content = msg.get("content")
-        if isinstance(content, list):
-            parts = [p.get("text", "") for p in content if isinstance(p, dict)]
-            return "".join(parts).strip()
-        return (content or "").strip()
+        return cls._extract_content_text(msg.get("content")).strip()
+
+    def _extract_openai_content(self, provider: str, raw_body: str) -> str:
+        """Extrae texto desde una respuesta JSON estándar o un stream SSE (data: ...)."""
+        try:
+            data = json.loads(raw_body)
+            if isinstance(data, dict) and data.get("error"):
+                raise ProviderHTTPError(502, self._extract_openai_error(502, raw_body), provider=provider)
+            return self._extract_openai_content_from_json(data)
+        except ValueError:
+            pass
+
+        parts: list[str] = []
+        for line in raw_body.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("data:"):
+                continue
+            payload_str = stripped[5:].strip()
+            if payload_str == "[DONE]":
+                break
+            try:
+                chunk = json.loads(payload_str)
+            except ValueError:
+                continue
+            if isinstance(chunk, dict) and chunk.get("error"):
+                raise ProviderHTTPError(502, self._extract_openai_error(502, payload_str), provider=provider)
+            choices = chunk.get("choices") or []
+            if choices:
+                msg_or_delta = choices[0].get("delta") or choices[0].get("message") or {}
+                piece = self._extract_content_text(msg_or_delta.get("content"))
+                if piece:
+                    parts.append(piece)
+        return "".join(parts).strip()
 
     def _invoke_openai_compatible(
         self,
@@ -435,6 +477,7 @@ class MultiProviderClient:
         prompt: str,
         is_probe: bool = False,
     ) -> str:
+        is_nvidia_stream = provider == "nvidia" and not is_probe
         if provider == "openrouter":
             api_key = self.openrouter_keys[key_index]
             url = OPENROUTER_CHAT_URL
@@ -451,7 +494,7 @@ class MultiProviderClient:
             headers = {
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
-                "Accept": "application/json",
+                "Accept": "text/event-stream, application/json" if is_nvidia_stream else "application/json",
             }
             use_system_ssl = True
         else:
@@ -465,8 +508,15 @@ class MultiProviderClient:
         }
         if is_probe and provider == "openrouter":
             payload["reasoning"] = {"effort": "low"}
+        if is_nvidia_stream:
+            payload["stream"] = True
 
-        req_timeout = 30 if is_probe else self.timeout_seconds
+        if is_probe:
+            req_timeout = 30
+        elif is_nvidia_stream:
+            req_timeout = min(self.timeout_seconds, NVIDIA_STREAM_TIMEOUT_SECONDS)
+        else:
+            req_timeout = self.timeout_seconds
 
         def _send(body_payload: dict[str, Any]) -> tuple[int, str, dict[str, str]]:
             if use_system_ssl:
@@ -482,11 +532,12 @@ class MultiProviderClient:
                 if is_probe and status_code == 400 and "reasoning" in err_msg.lower() and "reasoning" in payload:
                     payload.pop("reasoning", None)
                     status_code, raw_body, resp_headers = _send(payload)
+                elif status_code == 400 and "stream" in err_msg.lower() and payload.pop("stream", None):
+                    status_code, raw_body, resp_headers = _send(payload)
                 if status_code >= 400:
                     raise ProviderHTTPError(status_code, err_msg, provider=provider, headers=resp_headers)
 
-            data = json.loads(raw_body)
-            text = self._extract_openai_content_from_json(data)
+            text = self._extract_openai_content(provider, raw_body)
             self._record_usage(provider, key_index, model, is_probe=is_probe, ok=bool(text))
             return text
         except Exception:
@@ -897,8 +948,8 @@ class MultiProviderClient:
     ) -> tuple[list[Any], bool, str]:
         """
         Envía el prompt al slot activo y parsea una lista JSON válida.
-        Conmuta automáticamente entre modelos, claves y proveedores (Gemini -> OpenRouter)
-        si ocurre saturación o se agota la cuota diaria.
+        Conmuta automáticamente entre modelos, claves y proveedores
+        (Gemini -> OpenRouter -> NVIDIA NIM) si ocurre saturación o se agota la cuota diaria.
         """
         active = self.active_slots()
         if not active:
@@ -914,6 +965,7 @@ class MultiProviderClient:
         transient_failures = 0
         parse_failures = 0
         last_error = ""
+        failed_this_call: set[int] = set()
         switch_budget = len(self.slots) * 2 + 4
 
         while switch_budget > 0:
@@ -955,6 +1007,7 @@ class MultiProviderClient:
             except Exception as exc:
                 error_msg = str(exc)
                 last_error = error_msg
+                failed_this_call.add(id(slot))
                 kind = _classify_error(slot, exc)
 
                 if kind in ("auth_or_payment", "daily_limit", "model_unavailable"):
@@ -969,13 +1022,17 @@ class MultiProviderClient:
                         "daily_limit": "límite diario alcanzado",
                         "model_unavailable": "modelo no disponible",
                     }[kind]
-                    next_slot = remaining[0]
+                    slot_pos = 0
+                    for cand_idx, cand in enumerate(remaining):
+                        if id(cand) not in failed_this_call:
+                            slot_pos = cand_idx
+                            break
+                    next_slot = remaining[slot_pos]
                     print(
                         f"\n    ⚠️ {slot.display_name} {reason} → cambiando a {next_slot.display_name}...",
                         end=" ",
                         flush=True,
                     )
-                    slot_pos = 0
                     time.sleep(1.5)
                     continue
 
