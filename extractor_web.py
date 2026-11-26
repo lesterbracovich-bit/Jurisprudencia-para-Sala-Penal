@@ -61,6 +61,7 @@ except ImportError:
 from llm_client import (
     LimiteDiarioExcedidoError,
     PREFERRED_GEMINI_MODELS,
+    PREFERRED_NVIDIA_MODELS,
     PREFERRED_OPENROUTER_MODELS,
     init_client as _init_llm_client,
     select_model,
@@ -73,10 +74,12 @@ CSV_PATH = os.path.join(BASE_DIR, "reporte_jurisprudencia.csv")
 
 API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
+NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "").strip()
 
 # Modelos en orden de preferencia
 PREFERRED_MODELS = list(PREFERRED_GEMINI_MODELS)
 OPENROUTER_MODELS = list(PREFERRED_OPENROUTER_MODELS)
+NVIDIA_MODELS = list(PREFERRED_NVIDIA_MODELS)
 
 CHUNK_SIZE = 25_000
 CHUNK_OVERLAP = 3_000
@@ -148,12 +151,14 @@ MESES_MAP = {
 
 # ─── Inicialización de Proveedores IA ────────────────────────────────────────
 def init_client():
-    """Crea e inicializa el cliente multi-proveedor (Gemini + OpenRouter)."""
+    """Crea e inicializa el cliente multi-proveedor (Gemini + OpenRouter + NVIDIA NIM)."""
     return _init_llm_client(
         gemini_models=PREFERRED_MODELS,
         openrouter_models=OPENROUTER_MODELS,
+        nvidia_models=NVIDIA_MODELS,
         inline_gemini_key=API_KEY,
         inline_openrouter_key=OPENROUTER_API_KEY,
+        inline_nvidia_key=NVIDIA_API_KEY,
         timeout_ms=180000,
     )
 
@@ -1265,6 +1270,37 @@ def export_csv(conn):
 
 
 # ─── Determinación Inteligente de Fechas ─────────────────────────────────────
+def _reactivar_404_actuales_pendientes(conn):
+    """
+    Reactiva sentencias recientes (>= 01/10/2026) que pudieron quedar marcadas como
+    'Omitida: HTML 404' antes de que el TSJ publicara sus HTML definitivos.
+    """
+    c = conn.cursor()
+    c.execute(
+        "SELECT id, archivo FROM estado_bloques "
+        "WHERE estado = 'EXITOSO' AND error_detalle = 'Omitida: HTML 404'"
+    )
+    ids_reactivar = []
+    for row_id, arch in c.fetchall():
+        m = re.search(r"(\d{2})[-/](\d{2})[-/](\d{4})", arch or "")
+        if not m:
+            continue
+        f_dt = parse_fecha(f"{m.group(1)}/{m.group(2)}/{m.group(3)}")
+        if f_dt and f_dt >= FECHA_ACTUAL_INICIO:
+            ids_reactivar.append(row_id)
+
+    if ids_reactivar:
+        placeholders = ",".join("?" for _ in ids_reactivar)
+        c.execute(
+            f"UPDATE estado_bloques SET estado = 'ERROR', "
+            f"error_detalle = 'HTML 404 pendiente (esperando publicación en TSJ)' "
+            f"WHERE id IN ({placeholders})",
+            ids_reactivar,
+        )
+        conn.commit()
+        print(f"🔄 Se reactivaron {len(ids_reactivar)} sentencia(s) reciente(s) con HTML 404 previo para reintentar.")
+
+
 def _obtener_fechas_estado_bloques(conn, fecha_min=None, fecha_max=None):
     """
     Lee de estado_bloques las fechas con errores activos y las completadas,
@@ -1468,6 +1504,7 @@ def determinar_dias_a_procesar(conn, session, args):
         return dias_publicados, False, False
 
     # 6) MODO AUTOMÁTICO (Actual >= Oct 2026) con transición a Histórico si está al día
+    _reactivar_404_actuales_pendientes(conn)
     ultima_fecha_str = obtener_control(conn, CLAVE_CONTROL_ACTUAL)
     fechas_con_error, completadas_por_fecha = _obtener_fechas_estado_bloques(
         conn, fecha_min=FECHA_ACTUAL_INICIO
@@ -1524,52 +1561,30 @@ def determinar_dias_a_procesar(conn, session, args):
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
-def main():
-    print("=" * 60)
-    print("  EXTRACTOR WEB DE JURISPRUDENCIA – SALA DE CASACIÓN PENAL")
-    print("  Tribunal Supremo de Justicia de Venezuela")
-    print("  Extracción de Máximas Jurídicas Originales")
-    print("=" * 60)
-
-    args = sys.argv[1:]
-    reprocess_all = "--reprocesar-todo" in args or "--todos" in args
-
-    conn = init_db()
-    session = requests.Session()
-    session.verify = False
-
-    # 1) Determinar días a procesar (modo actual o respaldo histórico de nulidades)
-    dias_a_procesar, modo_historico, hay_mas_historico = determinar_dias_a_procesar(conn, session, args)
-
-    if not dias_a_procesar:
-        if modo_historico and not hay_mas_historico and obtener_control(conn, CLAVE_HIST_COMPLETADO) != "1":
-            guardar_control(conn, CLAVE_HIST_COMPLETADO, "1")
-        conn.close()
-        return
-
-    # 2) Inicializar cliente multi-proveedor y seleccionar modelos
-    print("\n🤖 Inicializando conexión con los proveedores de IA...")
-    client = init_client()
-    print("\n🔍 Verificando modelos disponibles (primario y respaldo)...")
-    primary, fallback = select_model(client)
-    print(f"\n✅ Modelo Primario: {primary}")
-    print(f"🛡️  Modelo de Respaldo: {fallback}")
-    or_backup = client.describe_openrouter_backup()
-    if or_backup and not primary.startswith("openrouter:"):
-        print(f"🔀 Respaldo OpenRouter: {or_backup}")
-
-    # 3) Procesar día a día
-    total_general_ins = 0
-    total_general_upd = 0
-    total_general_dup = 0
-    total_sentencias_procesadas = 0
-    dias_completados_en_run = 0
+def _procesar_lote_dias(
+    conn,
+    session,
+    client,
+    primary,
+    fallback,
+    dias_a_procesar,
+    modo_historico,
+    hay_mas_historico,
+    reprocess_all,
+    start_time,
+):
+    """Procesa una lista de días (en modo actual o en modo histórico de nulidades)."""
+    ins_total = 0
+    upd_total = 0
+    dup_total = 0
+    sentencias_total = 0
+    dias_completados = 0
+    textos_descargados = 0
 
     clave_control = CLAVE_CONTROL_HIST if modo_historico else CLAVE_CONTROL_ACTUAL
     limite_diario_alcanzado = False
     tiempo_limite_alcanzado = False
     bloqueo_avance_control = False
-    start_time = time.monotonic()
 
     for dia_idx, dia_info in enumerate(dias_a_procesar, 1):
         if limite_diario_alcanzado or tiempo_limite_alcanzado:
@@ -1599,7 +1614,7 @@ def main():
                 if not ultima_guardada_dt or dia_info["fecha_dt"] > ultima_guardada_dt:
                     guardar_control(conn, clave_control, fecha_str)
                     print(f"   📌 Control ({clave_control}) actualizado = {fecha_str}")
-            dias_completados_en_run += 1
+            dias_completados += 1
             continue
 
         print(f"   📥 Sentencias listadas para este día: {len(sentencias)}")
@@ -1631,7 +1646,7 @@ def main():
             if cat_pre == "EXTRADICION":
                 print("     🚫 Decisión de Extradición: se omite la extracción según directriz (0 máximas).")
                 guardar_estado_bloque(conn, archivo_id, 1, 1, "EXITOSO", 0, "Omitida: Extradición")
-                total_sentencias_procesadas += 1
+                sentencias_total += 1
                 continue
 
             # Descargar texto
@@ -1639,13 +1654,22 @@ def main():
             texto, status_code = descargar_texto_sentencia(session, url, return_status=True)
             if not texto:
                 if status_code == 404:
-                    print("⚠ HTML no disponible (404), se omite.", flush=True)
-                    guardar_estado_bloque(conn, archivo_id, 1, 1, "EXITOSO", 0, "Omitida: HTML 404")
-                    total_sentencias_procesadas += 1
+                    if modo_historico:
+                        print("⚠ HTML no disponible (404), se omite.", flush=True)
+                        guardar_estado_bloque(conn, archivo_id, 1, 1, "EXITOSO", 0, "Omitida: HTML 404")
+                        sentencias_total += 1
+                    else:
+                        print("⏳ HTML aún no publicado (404) en TSJ; queda pendiente para reintento.", flush=True)
+                        guardar_estado_bloque(
+                            conn, archivo_id, 1, 1, "ERROR", 0,
+                            "HTML 404 pendiente (esperando publicación en TSJ)",
+                        )
+                        hubo_errores_graves_en_dia = True
                 else:
                     print("✘ No se pudo descargar", flush=True)
                     hubo_errores_graves_en_dia = True
                 continue
+            textos_descargados += 1
             print(f"✔ ({len(texto):,} caracteres)", flush=True)
 
             if not ponente:
@@ -1659,19 +1683,19 @@ def main():
                 if categoria == "EXTRADICION":
                     print("     🚫 Decisión de Extradición: se omite (0 máximas).")
                     guardar_estado_bloque(conn, archivo_id, 1, 1, "EXITOSO", 0, "Omitida: Extradición")
-                    total_sentencias_procesadas += 1
+                    sentencias_total += 1
                     continue
                 if categoria == "OMITIDA_NO_NULIDAD":
                     print("     ⏭️  No es sentencia de nulidad: se omite (modo histórico).")
                     guardar_estado_bloque(conn, archivo_id, 1, 1, "EXITOSO", 0, "Omitida: No es nulidad")
-                    total_sentencias_procesadas += 1
+                    sentencias_total += 1
                     continue
             else:
                 categoria, min_m, max_m, instruccion_pauta = clasificar_pauta_decision(info, texto)
                 if categoria == "EXTRADICION":
                     print("     🚫 Decisión de Extradición: se omite la extracción según directriz (0 máximas).")
                     guardar_estado_bloque(conn, archivo_id, 1, 1, "EXITOSO", 0, "Omitida: Extradición")
-                    total_sentencias_procesadas += 1
+                    sentencias_total += 1
                     continue
 
             print(f"     ⚖️  Tipo de fallo: {categoria} (Pauta: {min_m} a {max_m} máximas)")
@@ -1688,7 +1712,7 @@ def main():
 
             if not pendientes:
                 print("     ✨ Esta sentencia ya estaba procesada exitosamente.")
-                total_sentencias_procesadas += 1
+                sentencias_total += 1
                 continue
 
             maximas_sentencia = []
@@ -1723,9 +1747,9 @@ def main():
                             m["numero"] = numero
                             m["fecha"] = fecha_str
                         i, u, d = insert_maximas(conn, maximas, archivo_id, modo_historico=modo_historico)
-                        total_general_ins += i
-                        total_general_upd += u
-                        total_general_dup += d
+                        ins_total += i
+                        upd_total += u
+                        dup_total += d
                         maximas_sentencia.extend(maximas)
                 else:
                     guardar_estado_bloque(conn, archivo_id, c_num, total_chunks, "ERROR", 0, err)
@@ -1735,7 +1759,7 @@ def main():
                 time.sleep(2)
 
             if limite_diario_alcanzado or tiempo_limite_alcanzado:
-                total_sentencias_procesadas += 1
+                sentencias_total += 1
                 break
 
             # Pase de recuperación para bloques con error
@@ -1769,9 +1793,9 @@ def main():
                                 m["numero"] = numero
                                 m["fecha"] = fecha_str
                             i, u, d = insert_maximas(conn, maximas, archivo_id, modo_historico=modo_historico)
-                            total_general_ins += i
-                            total_general_upd += u
-                            total_general_dup += d
+                            ins_total += i
+                            upd_total += u
+                            dup_total += d
                             maximas_sentencia.extend(maximas)
                     else:
                         guardar_estado_bloque(conn, archivo_id, r, total_chunks, "ERROR", 0, err)
@@ -1779,7 +1803,7 @@ def main():
                         hubo_errores_graves_en_dia = True
                     time.sleep(3)
 
-            total_sentencias_procesadas += 1
+            sentencias_total += 1
 
         # Al completar el día, verificar si quedan errores pendientes en este día
         fecha_sufijo_guion = fecha_str.replace("/", "-")
@@ -1801,7 +1825,7 @@ def main():
                     print(f"\n  📌 Control ({clave_control}) actualizado: última fecha registrada = {fecha_str}")
             else:
                 print(f"\n  ⏸️  Control ({clave_control}) retenido porque un día previo en esta ejecución falló al consultar la API.")
-            dias_completados_en_run += 1
+            dias_completados += 1
         else:
             bloqueo_avance_control = True
             print(f"\n  ⚠️  El día {fecha_str} tiene pendientes o se detuvo antes de concluir.")
@@ -1813,15 +1837,113 @@ def main():
         and not limite_diario_alcanzado
         and not tiempo_limite_alcanzado
         and not bloqueo_avance_control
-        and dias_completados_en_run == len(dias_a_procesar)
+        and dias_completados == len(dias_a_procesar)
     ):
         guardar_control(conn, CLAVE_HIST_COMPLETADO, "1")
         print("\n🏁 Revisión histórica (19/01/2000 – 30/09/2026) marcada como completada.")
 
+    return {
+        "ins": ins_total,
+        "upd": upd_total,
+        "dup": dup_total,
+        "sentencias": sentencias_total,
+        "dias_completados": dias_completados,
+        "dias_total": len(dias_a_procesar),
+        "textos_descargados": textos_descargados,
+        "limite_diario": limite_diario_alcanzado,
+        "tiempo_limite": tiempo_limite_alcanzado,
+    }
+
+
+def main():
+    print("=" * 60)
+    print("  EXTRACTOR WEB DE JURISPRUDENCIA – SALA DE CASACIÓN PENAL")
+    print("  Tribunal Supremo de Justicia de Venezuela")
+    print("  Extracción de Máximas Jurídicas Originales")
+    print("=" * 60)
+
+    args = sys.argv[1:]
+    reprocess_all = "--reprocesar-todo" in args or "--todos" in args
+    es_modo_explicito = any(
+        a in args for a in ("--fecha", "--mes", "--desde", "--todas", "--todo-el-ano", "--historico")
+    )
+
+    conn = init_db()
+    session = requests.Session()
+    session.verify = False
+
+    # 1) Determinar días a procesar (modo actual o respaldo histórico de nulidades)
+    dias_a_procesar, modo_historico, hay_mas_historico = determinar_dias_a_procesar(conn, session, args)
+
+    if not dias_a_procesar:
+        if modo_historico and not hay_mas_historico and obtener_control(conn, CLAVE_HIST_COMPLETADO) != "1":
+            guardar_control(conn, CLAVE_HIST_COMPLETADO, "1")
+        conn.close()
+        return
+
+    # 2) Inicializar cliente multi-proveedor y seleccionar modelos
+    print("\n🤖 Inicializando conexión con los proveedores de IA...")
+    client = init_client()
+    print("\n🔍 Verificando modelos disponibles (primario y respaldo)...")
+    primary, fallback = select_model(client)
+    print(f"\n✅ Modelo Primario: {primary}")
+    print(f"🛡️  Modelo de Respaldo: {fallback}")
+    or_backup = client.describe_openrouter_backup()
+    if or_backup and not primary.startswith("openrouter:"):
+        print(f"🔀 Respaldo OpenRouter: {or_backup}")
+    nv_backup = client.describe_nvidia_backup()
+    if nv_backup and not primary.startswith("nvidia:"):
+        print(f"🟢 Respaldo NVIDIA NIM: {nv_backup}")
+
+    # 3) Procesar día a día
+    start_time = time.monotonic()
+    res = _procesar_lote_dias(
+        conn, session, client, primary, fallback,
+        dias_a_procesar, modo_historico, hay_mas_historico, reprocess_all, start_time,
+    )
+
+    total_general_ins = res["ins"]
+    total_general_upd = res["upd"]
+    total_general_dup = res["dup"]
+    total_sentencias_procesadas = res["sentencias"]
+    dias_completados_en_run = res["dias_completados"]
+    dias_totales_en_run = res["dias_total"]
+    limite_diario_alcanzado = res["limite_diario"]
+    tiempo_limite_alcanzado = res["tiempo_limite"]
+    modo_resumen = "HISTÓRICO NULIDADES" if modo_historico else "ACTUAL"
+
+    # Si en modo automático actual todas las sentencias nuevas devolvieron 404 (aún sin HTML),
+    # quedan marcadas como pendientes y aprovechamos la cuota de hoy en el modo histórico.
+    if (
+        not modo_historico
+        and not es_modo_explicito
+        and res["textos_descargados"] == 0
+        and not limite_diario_alcanzado
+    ):
+        print("\n⏳ Las sentencias actuales aún no tienen HTML disponible en el TSJ; quedan pendientes para la próxima corrida.")
+        print("   Pasando al modo histórico de nulidades (19/01/2000 – 30/09/2026) para aprovechar la ejecución...")
+        dias_hist, hay_mas_hist = determinar_dias_historicos(conn, session)
+        if dias_hist:
+            res_hist = _procesar_lote_dias(
+                conn, session, client, primary, fallback,
+                dias_hist, True, hay_mas_hist, reprocess_all, start_time,
+            )
+            total_general_ins += res_hist["ins"]
+            total_general_upd += res_hist["upd"]
+            total_general_dup += res_hist["dup"]
+            total_sentencias_procesadas += res_hist["sentencias"]
+            dias_completados_en_run += res_hist["dias_completados"]
+            dias_totales_en_run += res_hist["dias_total"]
+            limite_diario_alcanzado = res_hist["limite_diario"]
+            tiempo_limite_alcanzado = res_hist["tiempo_limite"]
+            modo_resumen = "ACTUAL + HISTÓRICO NULIDADES"
+        elif not hay_mas_hist and obtener_control(conn, CLAVE_HIST_COMPLETADO) != "1":
+            guardar_control(conn, CLAVE_HIST_COMPLETADO, "1")
+
     if limite_diario_alcanzado:
         print("\n" + "=" * 60)
         print("🛑 LÍMITE DE CUOTA ALCANZADO EN LOS PROVEEDORES CONFIGURADOS")
-        print("   Se agotó la cuota disponible en Gemini y/o OpenRouter por el día de hoy.")
+        print("   Se agotó la cuota disponible en Gemini, OpenRouter y/o NVIDIA NIM por el día de hoy.")
         print("   Todas las máximas y sentencias procesadas con éxito están aseguradas en la BD.")
         print("   Las sentencias restantes quedaron registradas y se retomarán automáticamente")
         print("   en la próxima ejecución programada (a las 8:15 PM).")
@@ -1838,9 +1960,9 @@ def main():
     # 4) Resumen final
     total_ext, sent_unicas = count_sentencias(conn)
     print(f"\n{'=' * 60}")
-    print(f"  RESUMEN DE EJECUCIÓN WEB ({'HISTÓRICO NULIDADES' if modo_historico else 'ACTUAL'})")
+    print(f"  RESUMEN DE EJECUCIÓN WEB ({modo_resumen})")
     print(f"{'=' * 60}")
-    print(f"  📅 Días procesados:            {dias_completados_en_run}/{len(dias_a_procesar)}")
+    print(f"  📅 Días procesados:            {dias_completados_en_run}/{dias_totales_en_run}")
     print(f"  📄 Sentencias analizadas:      {total_sentencias_procesadas}")
     print(f"  ✅ Máximas nuevas añadidas:    {total_general_ins}")
     print(f"  📝 Máximas enriquecidas:       {total_general_upd}")

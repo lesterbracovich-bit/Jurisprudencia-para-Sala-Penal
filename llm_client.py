@@ -3,19 +3,22 @@
 """
 Cliente Unificado de IA con Respaldo Multi-Proveedor y Multi-Clave
 ==================================================================
-Soporta Google Gemini (`google-genai`) y OpenRouter (`chat/completions`),
-permitiendo configurar una o más API keys por proveedor y conmutar
-automáticamente cuando un modelo o proveedor alcanza su cuota diaria (429),
-se satura (500/503) o presenta errores de autenticación/créditos.
+Soporta Google Gemini (`google-genai`), OpenRouter (`chat/completions`) y
+NVIDIA NIM (`integrate.api.nvidia.com`), permitiendo configurar una o más
+API keys por proveedor y conmutar automáticamente cuando un modelo o proveedor
+alcanza su cuota diaria (429), se satura (500/503) o falla por autenticación.
 """
 
 from dataclasses import dataclass
 import json
 import os
 import re
+import ssl
 import sys
 import time
 from typing import Any, Callable, Optional
+import urllib.error
+import urllib.request
 
 import requests
 
@@ -28,6 +31,10 @@ except ImportError:
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_CHAT_URL = f"{OPENROUTER_BASE_URL}/chat/completions"
 OPENROUTER_KEY_URL = f"{OPENROUTER_BASE_URL}/key"
+
+NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
+NVIDIA_CHAT_URL = f"{NVIDIA_BASE_URL}/chat/completions"
+NVIDIA_MODELS_URL = f"{NVIDIA_BASE_URL}/models"
 
 # Modelos Gemini en orden de preferencia (Google AI Studio)
 PREFERRED_GEMINI_MODELS = [
@@ -53,12 +60,24 @@ PREFERRED_OPENROUTER_MODELS = [
     "openrouter/free",
 ]
 
+# Modelos en NVIDIA NIM (build.nvidia.com) adecuados para análisis jurídico en español + JSON
+PREFERRED_NVIDIA_MODELS = [
+    "mistralai/mistral-large-4-1t-a52b",
+    "nvidia/nemotron-3-ultra-550b-a55b",
+    "moonshotai/kimi-k3.1-pro",
+    "z-ai/glm-5.3-flash",
+    "minimaxai/minimax-m3.1-flash",
+    "nvidia/nemotron-3.5-super-vl-120b-a12b",
+    "google/gemma-3-12b-it",
+]
+
 PLACEHOLDER_KEYS = {
     "",
     "none",
     "null",
     "tu_clave_api_aqui",
     "tu_clave_openrouter_aqui",
+    "tu_clave_nvidia_aqui",
 }
 
 
@@ -93,7 +112,7 @@ class ModelSlot:
 
     @property
     def display_name(self) -> str:
-        prefix = "openrouter:" if self.provider == "openrouter" else ""
+        prefix = f"{self.provider}:" if self.provider in ("openrouter", "nvidia") else ""
         suffix = f" [{self.key_label}]" if self.key_index > 0 else ""
         return f"{prefix}{self.model}{suffix}"
 
@@ -235,7 +254,7 @@ def _classify_error(slot: ModelSlot, exc: Exception) -> str:
             )
         ):
             return "daily_limit"
-    else:
+    elif slot.provider == "openrouter":
         if any(
             k in low
             for k in (
@@ -244,6 +263,17 @@ def _classify_error(slot: ModelSlot, exc: Exception) -> str:
                 "per-day",
                 "daily limit",
                 "free model daily",
+            )
+        ):
+            return "daily_limit"
+    else:
+        if any(
+            k in low
+            for k in (
+                "requests per day",
+                "daily limit",
+                "credits exhausted",
+                "quota exceeded",
             )
         ):
             return "daily_limit"
@@ -281,26 +311,31 @@ def _classify_error(slot: ModelSlot, exc: Exception) -> str:
 
 
 class MultiProviderClient:
-    """Orquestador de modelos Gemini + OpenRouter con rotación y conmutación automática."""
+    """Orquestador de modelos Gemini + OpenRouter + NVIDIA NIM con rotación automática."""
 
     def __init__(
         self,
         gemini_keys: list[str],
         openrouter_keys: list[str],
+        nvidia_keys: Optional[list[str]] = None,
         gemini_models: Optional[list[str]] = None,
         openrouter_models: Optional[list[str]] = None,
+        nvidia_models: Optional[list[str]] = None,
         timeout_ms: Optional[int] = 180000,
     ):
         self.gemini_keys = gemini_keys
         self.openrouter_keys = openrouter_keys
+        self.nvidia_keys = list(nvidia_keys or [])
         self.gemini_models = list(gemini_models or PREFERRED_GEMINI_MODELS)
         self.openrouter_models = list(openrouter_models or PREFERRED_OPENROUTER_MODELS)
+        self.nvidia_models = list(nvidia_models or PREFERRED_NVIDIA_MODELS)
         self.timeout_seconds = (timeout_ms / 1000.0) if timeout_ms else 180.0
         self.gemini_clients: list[Any] = []
         self.slots: list[ModelSlot] = []
         self.primary_label: str = ""
         self.fallback_label: str = ""
         self._http = requests.Session()
+        self._ssl_ctx = ssl.create_default_context()
         self._usage_stats: dict[tuple[str, int, str], dict[str, int]] = {}
 
         for key in self.gemini_keys:
@@ -343,61 +378,45 @@ class MultiProviderClient:
             self._record_usage("gemini", key_index, model, is_probe=is_probe, ok=False)
             raise
 
-    def _invoke_openrouter(self, key_index: int, model: str, prompt: str, is_probe: bool = False) -> str:
-        api_key = self.openrouter_keys[key_index]
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://github.com/tsj-jurisprudencia",
-            "X-Title": "Extractor Jurisprudencia TSJ",
-        }
-        payload: dict[str, Any] = {
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.1,
-            "max_tokens": 2048 if is_probe else 8192,
-        }
-        if is_probe:
-            payload["reasoning"] = {"effort": "low"}
-
+    def _system_ssl_request(
+        self,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        payload: Optional[dict[str, Any]] = None,
+        timeout: float = 30.0,
+    ) -> tuple[int, str, dict[str, str]]:
+        """Ejecuta una petición HTTP usando el almacén de certificados del sistema (Windows/Linux)."""
+        data = json.dumps(payload).encode("utf-8") if payload is not None else None
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
-            resp = self._http.post(
-                OPENROUTER_CHAT_URL,
-                headers=headers,
-                json=payload,
-                timeout=30 if is_probe else self.timeout_seconds,
-            )
-            if resp.status_code >= 400:
-                err_msg = resp.text[:300]
-                try:
-                    body = resp.json()
-                    err_obj = body.get("error") or {}
-                    meta_raw = ((err_obj.get("metadata") or {}).get("raw")) or ""
-                    msg = err_obj.get("message") or err_msg
-                    err_msg = f"{msg} ({meta_raw})" if meta_raw and meta_raw not in msg else msg
-                except ValueError:
-                    pass
-
-                # Si el modelo no acepta el parámetro opcional 'reasoning' en un probe, reintentar sin él
-                if is_probe and resp.status_code == 400 and "reasoning" in err_msg.lower():
-                    payload.pop("reasoning", None)
-                    resp = self._http.post(OPENROUTER_CHAT_URL, headers=headers, json=payload, timeout=30)
-                    if resp.status_code < 400:
-                        text = self._extract_openrouter_content(resp)
-                        self._record_usage("openrouter", key_index, model, is_probe=is_probe, ok=bool(text))
-                        return text
-                raise ProviderHTTPError(resp.status_code, err_msg, provider="openrouter", headers=dict(resp.headers))
-
-            text = self._extract_openrouter_content(resp)
-            self._record_usage("openrouter", key_index, model, is_probe=is_probe, ok=bool(text))
-            return text
-        except Exception:
-            self._record_usage("openrouter", key_index, model, is_probe=is_probe, ok=False)
-            raise
+            with urllib.request.urlopen(req, timeout=timeout, context=self._ssl_ctx) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+                return resp.status, body, dict(resp.headers)
+        except urllib.error.HTTPError as err:
+            body = err.read().decode("utf-8", errors="replace")
+            return err.code, body, dict(err.headers or {})
 
     @staticmethod
-    def _extract_openrouter_content(resp: requests.Response) -> str:
-        data = resp.json()
+    def _extract_openai_error(status_code: int, raw_text: str) -> str:
+        err_msg = raw_text[:300]
+        try:
+            body = json.loads(raw_text)
+            err_obj = body.get("error") or {}
+            if isinstance(err_obj, dict):
+                meta_raw = ((err_obj.get("metadata") or {}).get("raw")) or ""
+                msg = err_obj.get("message") or err_msg
+                return f"{msg} ({meta_raw})" if meta_raw and meta_raw not in msg else msg
+            if isinstance(err_obj, str):
+                return err_obj
+            if body.get("detail"):
+                return str(body["detail"])
+        except ValueError:
+            pass
+        return err_msg
+
+    @staticmethod
+    def _extract_openai_content_from_json(data: dict[str, Any]) -> str:
         choices = data.get("choices") or []
         if not choices:
             return ""
@@ -407,6 +426,91 @@ class MultiProviderClient:
             parts = [p.get("text", "") for p in content if isinstance(p, dict)]
             return "".join(parts).strip()
         return (content or "").strip()
+
+    def _invoke_openai_compatible(
+        self,
+        provider: str,
+        key_index: int,
+        model: str,
+        prompt: str,
+        is_probe: bool = False,
+    ) -> str:
+        if provider == "openrouter":
+            api_key = self.openrouter_keys[key_index]
+            url = OPENROUTER_CHAT_URL
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://github.com/tsj-jurisprudencia",
+                "X-Title": "Extractor Jurisprudencia TSJ",
+            }
+            use_system_ssl = False
+        elif provider == "nvidia":
+            api_key = self.nvidia_keys[key_index]
+            url = NVIDIA_CHAT_URL
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            }
+            use_system_ssl = True
+        else:
+            raise ValueError(f"Proveedor OpenAI-compatible desconocido: {provider}")
+
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.1,
+            "max_tokens": 2048 if is_probe else 8192,
+        }
+        if is_probe and provider == "openrouter":
+            payload["reasoning"] = {"effort": "low"}
+
+        req_timeout = 30 if is_probe else self.timeout_seconds
+
+        def _send(body_payload: dict[str, Any]) -> tuple[int, str, dict[str, str]]:
+            if use_system_ssl:
+                return self._system_ssl_request("POST", url, headers, body_payload, timeout=req_timeout)
+            resp = self._http.post(url, headers=headers, json=body_payload, timeout=req_timeout)
+            raw_body = resp.text if getattr(resp, "text", "") else json.dumps(resp.json())
+            return resp.status_code, raw_body, dict(resp.headers)
+
+        try:
+            status_code, raw_body, resp_headers = _send(payload)
+            if status_code >= 400:
+                err_msg = self._extract_openai_error(status_code, raw_body)
+                if is_probe and status_code == 400 and "reasoning" in err_msg.lower() and "reasoning" in payload:
+                    payload.pop("reasoning", None)
+                    status_code, raw_body, resp_headers = _send(payload)
+                if status_code >= 400:
+                    raise ProviderHTTPError(status_code, err_msg, provider=provider, headers=resp_headers)
+
+            data = json.loads(raw_body)
+            text = self._extract_openai_content_from_json(data)
+            self._record_usage(provider, key_index, model, is_probe=is_probe, ok=bool(text))
+            return text
+        except Exception:
+            self._record_usage(provider, key_index, model, is_probe=is_probe, ok=False)
+            raise
+
+    def _invoke_openrouter(self, key_index: int, model: str, prompt: str, is_probe: bool = False) -> str:
+        return self._invoke_openai_compatible("openrouter", key_index, model, prompt, is_probe=is_probe)
+
+    def _fetch_nvidia_catalog(self) -> set[str]:
+        """Consulta el catálogo público de NVIDIA NIM (/v1/models) usando SSL del sistema."""
+        try:
+            status_code, body, _ = self._system_ssl_request(
+                "GET",
+                NVIDIA_MODELS_URL,
+                headers={"Accept": "application/json"},
+                timeout=15,
+            )
+            if status_code == 200:
+                data = json.loads(body).get("data") or []
+                return {m.get("id", "") for m in data if isinstance(m, dict) and m.get("id")}
+        except Exception:
+            pass
+        return set()
 
     def _validate_openrouter_key(self, key_index: int) -> tuple[bool, str]:
         """Valida una API key de OpenRouter usando GET /api/v1/key sin gastar cuota de inferencia."""
@@ -517,10 +621,44 @@ class MultiProviderClient:
 
         return found
 
+    def _probe_openai_provider_slots(self, provider_title: str, provider: str, slots: list[ModelSlot]) -> list[ModelSlot]:
+        """Verifica en orden los slots de un proveedor OpenAI-compatible hasta confirmar uno operativo."""
+        print(f"\n  🌐 Verificando modelos disponibles en {provider_title}...", flush=True)
+        verified: list[ModelSlot] = []
+        remaining: list[ModelSlot] = []
+        for slot in slots:
+            if slot.exhausted:
+                continue
+            if verified:
+                remaining.append(slot)
+                continue
+            print(f"  Probando {provider_title}: {slot.display_name} ...", end=" ", flush=True)
+            ok, err = self._probe_call(
+                lambda s=slot: self._invoke_openai_compatible(
+                    provider, s.key_index, s.model, "Responde solo: OK", is_probe=True
+                ),
+                slot.display_name,
+            )
+            if ok:
+                print("✔ disponible", flush=True)
+                slot.verified = True
+                verified.append(slot)
+            else:
+                print(f"✘ ({err})", flush=True)
+                low_err = err.lower()
+                if any(k in low_err for k in ("401", "402", "403", "unauthorized", "credits", "api key")):
+                    slot.exhausted = True
+                    for other in slots:
+                        if other.key_index == slot.key_index:
+                            other.exhausted = True
+                elif any(k in low_err for k in ("404", "not found", "invalid model", "no endpoints")):
+                    slot.exhausted = True
+        return verified + [s for s in remaining if not s.exhausted]
+
     def select_models(self) -> tuple[str, str]:
         """
-        Verifica los modelos disponibles en Gemini y prepara los de OpenRouter
-        como respaldo (sin gastar peticiones gratuitas de OpenRouter si Gemini ya responde).
+        Verifica los modelos disponibles en Gemini y prepara OpenRouter + NVIDIA NIM
+        como respaldo escalonado (sin gastar peticiones de reserva si ya hay capa previa).
         """
         self.slots = []
         gemini_verified: list[ModelSlot] = []
@@ -528,7 +666,6 @@ class MultiProviderClient:
         # 1) Probar claves de Gemini
         for idx in range(len(self.gemini_keys)):
             if gemini_verified:
-                # Clave adicional de Gemini: encolar sin frenar el arranque
                 label = f"Gemini #{idx + 1}"
                 for m in self.gemini_models:
                     self.slots.append(ModelSlot("gemini", m, idx, label, verified=False))
@@ -559,47 +696,48 @@ class MultiProviderClient:
                     )
                 )
 
-        # Si Gemini no logró ningún modelo operativo, probar OpenRouter hasta verificar al menos uno
         if not gemini_verified and openrouter_slots:
-            print("\n  🌐 Verificando modelos disponibles en OpenRouter...", flush=True)
-            verified_or: list[ModelSlot] = []
-            remaining_or: list[ModelSlot] = []
-            for slot in openrouter_slots:
-                if slot.exhausted:
-                    continue
-                if verified_or:
-                    remaining_or.append(slot)
-                    continue
-                print(f"  Probando OpenRouter: {slot.display_name} ...", end=" ", flush=True)
-                ok, err = self._probe_call(
-                    lambda s=slot: self._invoke_openrouter(s.key_index, s.model, "Responde solo: OK", is_probe=True),
-                    slot.display_name,
-                )
-                if ok:
-                    print("✔ disponible", flush=True)
-                    slot.verified = True
-                    verified_or.append(slot)
-                else:
-                    print(f"✘ ({err})", flush=True)
-                    low_err = err.lower()
-                    if any(k in low_err for k in ("401", "402", "403", "unauthorized", "credits")):
-                        slot.exhausted = True
-                        for other in openrouter_slots:
-                            if other.key_index == slot.key_index:
-                                other.exhausted = True
-                    elif any(k in low_err for k in ("404", "not found", "invalid model", "no endpoints")):
-                        slot.exhausted = True
-            openrouter_slots = verified_or + [s for s in remaining_or if not s.exhausted]
+            openrouter_slots = self._probe_openai_provider_slots("OpenRouter", "openrouter", openrouter_slots)
 
         self.slots.extend(openrouter_slots)
+        has_active_prior = bool(gemini_verified or any(s.verified for s in openrouter_slots))
+
+        # 3) Preparar claves de NVIDIA NIM como 3ra capa
+        nvidia_slots: list[ModelSlot] = []
+        if self.nvidia_keys:
+            catalog = self._fetch_nvidia_catalog()
+            modelos_nv = [m for m in self.nvidia_models if not catalog or m in catalog]
+            if not modelos_nv:
+                modelos_nv = list(self.nvidia_models)
+            for idx in range(len(self.nvidia_keys)):
+                label = f"NVIDIA #{idx + 1}"
+                print(
+                    f"  🔑 NVIDIA NIM #{idx + 1}: clave en reserva ({len(modelos_nv)} modelo(s) listos)",
+                    flush=True,
+                )
+                for m in modelos_nv:
+                    nvidia_slots.append(
+                        ModelSlot(
+                            provider="nvidia",
+                            model=m,
+                            key_index=idx,
+                            key_label=label,
+                            verified=False,
+                        )
+                    )
+
+            if not has_active_prior and nvidia_slots:
+                nvidia_slots = self._probe_openai_provider_slots("NVIDIA NIM", "nvidia", nvidia_slots)
+
+        self.slots.extend(nvidia_slots)
         active = self.active_slots()
 
         if not active:
-            print("\n❌ No se encontró ningún modelo disponible (ni en Gemini ni en OpenRouter).")
+            print("\n❌ No se encontró ningún modelo disponible (Gemini, OpenRouter ni NVIDIA NIM).")
             sys.exit(1)
 
         if not gemini_verified and not any(s.verified for s in active):
-            print("\n❌ No se pudo verificar ningún modelo operativo en OpenRouter.")
+            print("\n❌ No se pudo verificar ningún modelo operativo en los proveedores de respaldo.")
             sys.exit(1)
 
         self.primary_label = active[0].display_name
@@ -609,13 +747,19 @@ class MultiProviderClient:
     def active_slots(self) -> list[ModelSlot]:
         return [s for s in self.slots if not s.exhausted]
 
-    def describe_openrouter_backup(self) -> str:
-        or_slots = [s for s in self.active_slots() if s.provider == "openrouter"]
-        if not or_slots:
+    def _describe_provider_backup(self, provider: str) -> str:
+        slots = [s for s in self.active_slots() if s.provider == provider]
+        if not slots:
             return ""
-        first = or_slots[0].display_name
-        extra = len(or_slots) - 1
+        first = slots[0].display_name
+        extra = len(slots) - 1
         return f"{first} (+ {extra} modelo(s) en reserva)" if extra > 0 else first
+
+    def describe_openrouter_backup(self) -> str:
+        return self._describe_provider_backup("openrouter")
+
+    def describe_nvidia_backup(self) -> str:
+        return self._describe_provider_backup("nvidia")
 
     def get_usage_summary(self) -> dict[str, Any]:
         """Devuelve métricas acumuladas de peticiones enviadas por proveedor y modelo."""
@@ -624,6 +768,7 @@ class MultiProviderClient:
         total_extract_ok = 0
         total_errors = 0
         by_provider: dict[tuple[str, int], dict[str, Any]] = {}
+        provider_names = {"gemini": "Gemini", "openrouter": "OpenRouter", "nvidia": "NVIDIA NIM"}
 
         for (provider, key_index, model), counts in self._usage_stats.items():
             sent = counts["sent"]
@@ -640,7 +785,7 @@ class MultiProviderClient:
                 {
                     "provider": provider,
                     "key_index": key_index,
-                    "label": f"{'Gemini' if provider == 'gemini' else 'OpenRouter'} #{key_index + 1}",
+                    "label": f"{provider_names.get(provider, provider)} #{key_index + 1}",
                     "sent": 0,
                     "probes": 0,
                     "extract_ok": 0,
@@ -677,6 +822,7 @@ class MultiProviderClient:
         )
 
         printed_or_keys: set[int] = set()
+        printed_nv_keys: set[int] = set()
         for grp in summary["by_provider"]:
             extra_quota = ""
             if grp["provider"] == "openrouter" and check_openrouter_quota:
@@ -684,6 +830,8 @@ class MultiProviderClient:
                 ok_key, info_key = self._validate_openrouter_key(grp["key_index"])
                 if ok_key and info_key:
                     extra_quota = f" | estado: {info_key}"
+            elif grp["provider"] == "nvidia":
+                printed_nv_keys.add(grp["key_index"])
             print(
                 f"  • {grp['label']}: {grp['sent']} env. "
                 f"(inicio: {grp['probes']}, extracción ok: {grp['extract_ok']}, errores: {grp['errors']}){extra_quota}"
@@ -695,13 +843,16 @@ class MultiProviderClient:
                     f"(inicio: {cnt['probes']}, ext: {ext_sent}, ok: {cnt['extract_ok']}, errores: {cnt['errors']})"
                 )
 
-        # Si hay claves de OpenRouter en reserva que no se llegaron a usar, mostrar su cuota restante
         if check_openrouter_quota:
             for idx in range(len(self.openrouter_keys)):
                 if idx not in printed_or_keys:
                     ok_key, info_key = self._validate_openrouter_key(idx)
                     status_txt = info_key if ok_key else f"inválida ({info_key})"
                     print(f"  • OpenRouter #{idx + 1}: 0 env. (sin uso en esta corrida | {status_txt})")
+
+        for idx in range(len(self.nvidia_keys)):
+            if idx not in printed_nv_keys:
+                print(f"  • NVIDIA NIM #{idx + 1}: 0 env. (sin uso en esta corrida | en reserva)")
 
     def _demote_slot(self, slot: ModelSlot) -> bool:
         """
@@ -779,7 +930,9 @@ class MultiProviderClient:
                 if slot.provider == "gemini":
                     raw = self._invoke_gemini(slot.key_index, slot.model, prompt)
                 else:
-                    raw = self._invoke_openrouter(slot.key_index, slot.model, prompt, is_probe=False)
+                    raw = self._invoke_openai_compatible(
+                        slot.provider, slot.key_index, slot.model, prompt, is_probe=False
+                    )
 
                 if not raw:
                     raise ValueError("Respuesta vacía del modelo.")
@@ -873,8 +1026,10 @@ class MultiProviderClient:
 def init_client(
     gemini_models: Optional[list[str]] = None,
     openrouter_models: Optional[list[str]] = None,
+    nvidia_models: Optional[list[str]] = None,
     inline_gemini_key: str = "",
     inline_openrouter_key: str = "",
+    inline_nvidia_key: str = "",
     timeout_ms: Optional[int] = 180000,
 ) -> MultiProviderClient:
     """Inicializa el cliente multi-proveedor leyendo variables de entorno y respaldos."""
@@ -893,17 +1048,30 @@ def init_client(
         ),
         inline_default=inline_openrouter_key,
     )
+    nvidia_keys = collect_api_keys(
+        "NVIDIA_API_KEY",
+        extra_vars=(
+            "NVIDIA_API_KEYS",
+            "NVIDIA_API_KEY_2",
+            "NVIDIA_API_KEY_3",
+            "NVIDIA_API_KEY_4",
+        ),
+        inline_default=inline_nvidia_key,
+    )
 
     env_or_models = os.environ.get("OPENROUTER_MODELS", "").strip()
     custom_or_models = [m.strip() for m in env_or_models.split(",") if m.strip()] if env_or_models else None
+    env_nv_models = os.environ.get("NVIDIA_MODELS", "").strip()
+    custom_nv_models = [m.strip() for m in env_nv_models.split(",") if m.strip()] if env_nv_models else None
 
-    if not gemini_keys and not openrouter_keys:
+    if not gemini_keys and not openrouter_keys and not nvidia_keys:
         print("=" * 60)
-        print("⚠  ATENCIÓN: No se detectaron claves API (GEMINI_API_KEY ni OPENROUTER_API_KEY).")
+        print("⚠  ATENCIÓN: No se detectaron claves API (GEMINI_API_KEY, OPENROUTER_API_KEY ni NVIDIA_API_KEY).")
         print("   Configura al menos una en GitHub Actions:")
         print("   (Settings > Secrets and variables > Actions)")
         print("   • GEMINI_API_KEY       (Google AI Studio)")
-        print("   • OPENROUTER_API_KEY   (OpenRouter como principal o respaldo)")
+        print("   • OPENROUTER_API_KEY   (OpenRouter - 2da capa)")
+        print("   • NVIDIA_API_KEY       (NVIDIA NIM - 3ra capa)")
         print("   O defínelas como variables de entorno antes de ejecutar.")
         print("=" * 60)
         sys.exit(1)
@@ -911,8 +1079,10 @@ def init_client(
     return MultiProviderClient(
         gemini_keys=gemini_keys,
         openrouter_keys=openrouter_keys,
+        nvidia_keys=nvidia_keys,
         gemini_models=gemini_models,
         openrouter_models=custom_or_models or openrouter_models,
+        nvidia_models=custom_nv_models or nvidia_models,
         timeout_ms=timeout_ms,
     )
 
