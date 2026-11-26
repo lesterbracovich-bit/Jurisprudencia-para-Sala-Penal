@@ -242,7 +242,9 @@ def listar_sentencias_por_fecha(session, fecha_str, sala_id=SALA_ID, return_ok=F
         print(f"    ⚠ Respuesta no es JSON válido para {fecha_str}")
         return ([], False) if return_ok else []
 
-    coleccion = data.get("coleccion", {})
+    coleccion = data.get("coleccion") or {}
+    if not isinstance(coleccion, dict):
+        coleccion = {}
     sentencias_raw = coleccion.get("SENTENCIA", [])
     if isinstance(sentencias_raw, dict):
         sentencias_raw = [sentencias_raw]
@@ -811,6 +813,22 @@ def extract_maximas(client, primary_model, fallback_model, text_chunk,
 
 
 # ─── Base de Datos y Seguimiento ─────────────────────────────────────────────
+def asegurar_columnas_enlace(conn):
+    """Agrega columnas de enlace oficial TSJ a `sentencias` si aún no existen."""
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(sentencias)")
+    cols = {r[1] for r in cur.fetchall()}
+    added = False
+    if "enlace" not in cols:
+        cur.execute("ALTER TABLE sentencias ADD COLUMN enlace TEXT DEFAULT ''")
+        added = True
+    if "enlace_estado" not in cols:
+        cur.execute("ALTER TABLE sentencias ADD COLUMN enlace_estado TEXT DEFAULT ''")
+        added = True
+    if added:
+        conn.commit()
+
+
 def init_db():
     """Inicializa tablas en SQLite."""
     conn = sqlite3.connect(DB_PATH)
@@ -825,9 +843,12 @@ def init_db():
             extracto TEXT,
             contenido_citado TEXT,
             ratificaciones TEXT,
-            archivo_origen TEXT
+            archivo_origen TEXT,
+            enlace TEXT DEFAULT '',
+            enlace_estado TEXT DEFAULT ''
         )
     """)
+    asegurar_columnas_enlace(conn)
     c.execute("CREATE INDEX IF NOT EXISTS idx_sentencias_num_sala ON sentencias(numero, sala)")
     c.execute("""
         CREATE TABLE IF NOT EXISTS estado_bloques (
@@ -1102,7 +1123,7 @@ def es_misma_maxima_inter_sentencia(r_nuevo, fila_existente):
     return False
 
 
-def insert_maximas(conn, maximas, archivo_origen, modo_historico=False):
+def insert_maximas(conn, maximas, archivo_origen, modo_historico=False, enlace=""):
     """
     Inserta o enriquece máximas en la base de datos.
     Aplica regla anti-duplicados entre sentencias distintas (diferenciando año):
@@ -1110,8 +1131,11 @@ def insert_maximas(conn, maximas, archivo_origen, modo_historico=False):
     si es posterior, actualiza la ratificación en el registro original, y si
     es un criterio duplicado en revisión histórica anterior, se ignora.
     """
+    asegurar_columnas_enlace(conn)
     cur = conn.cursor()
     ins = upd = dup = 0
+    enlace_limpio = str(enlace or "").strip()
+    estado_enlace = "ENCONTRADO" if enlace_limpio else ""
 
     for s in maximas:
         r = limpiar_y_validar_maxima(s)
@@ -1121,7 +1145,7 @@ def insert_maximas(conn, maximas, archivo_origen, modo_historico=False):
         # ── 1) Buscar si coincide con la MISMA sentencia (mismo número, sala y año) ──
         cur.execute(
             "SELECT id, COALESCE(tema,''), extracto, contenido_citado, fecha, "
-            "COALESCE(ratificaciones,'') FROM sentencias WHERE numero=? AND sala=?",
+            "COALESCE(ratificaciones,''), COALESCE(enlace,'') FROM sentencias WHERE numero=? AND sala=?",
             (r["numero"], r["sala"]),
         )
         existentes_misma_sentencia = [
@@ -1131,17 +1155,17 @@ def insert_maximas(conn, maximas, archivo_origen, modo_historico=False):
 
         coincidente = None
         for fila in existentes_misma_sentencia:
-            fid, et, ee, ec, ef, er = fila
+            fid, et, ee, ec, ef, er, _enl = fila
             if son_mismo_tema(r["tema"], r["extracto"], et, ee, r["contenido_citado"], ec):
                 coincidente = fila
                 break
 
         if coincidente is not None:
             # Enriquecer registro existente de la misma sentencia
-            rid, xt, xe, xc, xf, xr = coincidente
-            xc = xc or ""; xe = xe or ""; xf = xf or ""; xr = xr or ""
+            rid, xt, xe, xc, xf, xr, xenl = coincidente
+            xc = xc or ""; xe = xe or ""; xf = xf or ""; xr = xr or ""; xenl = xenl or ""
             act = False
-            nt, nc, ne, nf, nr = xt, xc, xe, xf, xr
+            nt, nc, ne, nf, nr, nenl = xt, xc, xe, xf, xr, xenl
 
             if r["tema"] and not xt:
                 nt = r["tema"]; act = True
@@ -1155,12 +1179,16 @@ def insert_maximas(conn, maximas, archivo_origen, modo_historico=False):
                 nf = r["fecha"]; act = True
             if r["ratificaciones"] and len(r["ratificaciones"]) > len(xr):
                 nr = r["ratificaciones"]; act = True
+            if enlace_limpio and not xenl:
+                nenl = enlace_limpio; act = True
 
             if act:
                 cur.execute(
                     "UPDATE sentencias SET tema=?,contenido_citado=?,extracto=?,"
-                    "fecha=?,ratificaciones=?,archivo_origen=? WHERE id=?",
-                    (nt, nc, ne, nf, nr, archivo_origen, rid),
+                    "fecha=?,ratificaciones=?,archivo_origen=?,enlace=?,"
+                    "enlace_estado=CASE WHEN ? != '' THEN 'ENCONTRADO' ELSE COALESCE(enlace_estado,'') END "
+                    "WHERE id=?",
+                    (nt, nc, ne, nf, nr, archivo_origen, nenl, nenl, rid),
                 )
                 upd += 1
             else:
@@ -1210,9 +1238,11 @@ def insert_maximas(conn, maximas, archivo_origen, modo_historico=False):
         # ── 3) Es una máxima nueva original: Insertar nuevo registro ──
         cur.execute(
             "INSERT INTO sentencias (numero,sala,fecha,tema,extracto,"
-            "contenido_citado,ratificaciones,archivo_origen) VALUES (?,?,?,?,?,?,?,?)",
+            "contenido_citado,ratificaciones,archivo_origen,enlace,enlace_estado) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
             (r["numero"], r["sala"], r["fecha"], r["tema"], r["extracto"],
-             r["contenido_citado"], r["ratificaciones"], archivo_origen),
+             r["contenido_citado"], r["ratificaciones"], archivo_origen,
+             enlace_limpio, estado_enlace),
         )
         ins += 1
 
@@ -1254,17 +1284,18 @@ def count_sentencias(conn):
 
 def export_csv(conn):
     """Exporta la tabla sentencias a CSV compatible con Excel."""
+    asegurar_columnas_enlace(conn)
     cur = conn.cursor()
     cur.execute(
         "SELECT id,numero,sala,fecha,COALESCE(tema,''),extracto,contenido_citado,"
-        "COALESCE(ratificaciones,''),archivo_origen FROM sentencias ORDER BY id"
+        "COALESCE(ratificaciones,''),archivo_origen,COALESCE(enlace,'') FROM sentencias ORDER BY id"
     )
     rows = cur.fetchall()
     with open(CSV_PATH, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f, delimiter=";")
         w.writerow(["ID","Número","Sala","Fecha","Tema / Punto Jurídico",
                      "Extracto (Resumen)","Contenido Citado (Textual)",
-                     "Ratificaciones / Precedentes","Archivo Origen"])
+                     "Ratificaciones / Precedentes","Archivo Origen","Enlace TSJ"])
         w.writerows(rows)
     print(f"\n📊 CSV exportado: {CSV_PATH}  ({len(rows)} registros)")
 
@@ -1746,7 +1777,7 @@ def _procesar_lote_dias(
                         for m in maximas:
                             m["numero"] = numero
                             m["fecha"] = fecha_str
-                        i, u, d = insert_maximas(conn, maximas, archivo_id, modo_historico=modo_historico)
+                        i, u, d = insert_maximas(conn, maximas, archivo_id, modo_historico=modo_historico, enlace=url)
                         ins_total += i
                         upd_total += u
                         dup_total += d
@@ -1792,7 +1823,7 @@ def _procesar_lote_dias(
                             for m in maximas:
                                 m["numero"] = numero
                                 m["fecha"] = fecha_str
-                            i, u, d = insert_maximas(conn, maximas, archivo_id, modo_historico=modo_historico)
+                            i, u, d = insert_maximas(conn, maximas, archivo_id, modo_historico=modo_historico, enlace=url)
                             ins_total += i
                             upd_total += u
                             dup_total += d

@@ -8,6 +8,7 @@ filtrar y leer sentencias y extractos jurisprudenciales del TSJ
 almacenados en SQLite (jurisprudencia_ia.db).
 """
 
+import html
 import os
 import re
 import sqlite3
@@ -169,6 +170,9 @@ def load_data():
     if "tema" not in cols:
         cursor.execute("ALTER TABLE sentencias ADD COLUMN tema TEXT")
         conn.commit()
+    if "enlace" not in cols:
+        cursor.execute("ALTER TABLE sentencias ADD COLUMN enlace TEXT DEFAULT ''")
+        conn.commit()
 
     query = """
         SELECT 
@@ -180,7 +184,8 @@ def load_data():
             COALESCE(extracto, '') AS extracto,
             COALESCE(contenido_citado, '') AS contenido_citado,
             COALESCE(ratificaciones, '') AS ratificaciones,
-            COALESCE(archivo_origen, '') AS archivo_origen
+            COALESCE(archivo_origen, '') AS archivo_origen,
+            COALESCE(enlace, '') AS enlace
         FROM sentencias
         ORDER BY id DESC
     """
@@ -473,6 +478,7 @@ def main():
         contenido_citado = row["contenido_citado"]
         ratificaciones = row.get("ratificaciones", "") or ""
         archivo = row["archivo_origen"]
+        enlace = str(row.get("enlace", "") or "").strip()
 
         # Tarjeta limpia con borde
         with st.container(border=True):
@@ -538,6 +544,16 @@ def main():
             if contenido_citado.strip() and contenido_citado.strip() != "Sin cita textual expresa":
                 st.markdown("**📜 Texto Literal Citado en el Documento:**")
                 st.markdown(f'<div class="cita-box">"{contenido_citado}"</div>', unsafe_allow_html=True)
+
+            if enlace:
+                safe_url = html.escape(enlace, quote=True)
+                st.markdown(
+                    f'<div style="margin-top: 10px;">'
+                    f'<a href="{safe_url}" target="_blank" rel="noopener noreferrer" '
+                    f'style="font-weight: 600; text-decoration: none;">'
+                    f'🔗 Ver sentencia original en el TSJ</a></div>',
+                    unsafe_allow_html=True,
+                )
 
     # Controles de paginación inferiores (al final de los 20 criterios)
     st.write("")
