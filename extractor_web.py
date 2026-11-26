@@ -248,10 +248,21 @@ def listar_sentencias_por_fecha(session, fecha_str, sala_id=SALA_ID, return_ok=F
     sentencias_raw = coleccion.get("SENTENCIA", [])
     if isinstance(sentencias_raw, dict):
         sentencias_raw = [sentencias_raw]
+    elif not isinstance(sentencias_raw, list):
+        sentencias_raw = []
+
+    def _campo_texto(registro, clave, default=""):
+        val = registro.get(clave)
+        if isinstance(val, (str, int, float)) and not isinstance(val, bool):
+            texto = str(val).strip()
+            return texto if texto else default
+        return default
 
     sentencias = []
     for s in sentencias_raw:
-        nombre_doc = (s.get("SSENTNOMBREDOC") or "").strip()
+        if not isinstance(s, dict):
+            continue
+        nombre_doc = _campo_texto(s, "SSENTNOMBREDOC")
         if not nombre_doc or nombre_doc.lower() in ("null", "none", "-"):
             continue
 
@@ -259,23 +270,23 @@ def listar_sentencias_por_fecha(session, fecha_str, sala_id=SALA_ID, return_ok=F
             r"(\d+)-(\d+)-(\d+)-(\d{4})-(.+?)\.HTML?",
             nombre_doc, re.IGNORECASE
         )
-        raw_num_api = (s.get("SSENTNUMERO") or "").strip()
+        raw_num_api = _campo_texto(s, "SSENTNUMERO")
         if match:
             numero = match.group(2)
             expediente = match.group(5)
         elif raw_num_api and raw_num_api.lower() not in ("null", "none", "-"):
             numero = raw_num_api
-            expediente = (s.get("SSENTEXPEDIENTE") or "?").strip()
+            expediente = _campo_texto(s, "SSENTEXPEDIENTE", "?")
         else:
             match_old = re.match(r"^([A-Za-z]?-?\d+)-", nombre_doc)
-            numero = match_old.group(1) if match_old else str(s.get("SSENTID") or "?")
-            expediente = (s.get("SSENTEXPEDIENTE") or "?").strip()
+            numero = match_old.group(1) if match_old else (_campo_texto(s, "SSENTID", "?") or "?")
+            expediente = _campo_texto(s, "SSENTEXPEDIENTE", "?")
 
         if numero.isdigit():
             numero = numero.lstrip("0") or "0"
 
-        nombre_mes = (s.get("NOMBREMES") or "").strip().lower()
-        sala_dir = (s.get("SSALADIR") or SALA_DIR).strip().lower()
+        nombre_mes = _campo_texto(s, "NOMBREMES").lower()
+        sala_dir = _campo_texto(s, "SSALADIR", SALA_DIR).lower()
         doc_url = f"{TSJ_HISTORICO_BASE}/{sala_dir}/{quote(nombre_mes, safe='')}/{quote(nombre_doc, safe='().-_~')}"
 
         sentencias.append({
@@ -283,10 +294,10 @@ def listar_sentencias_por_fecha(session, fecha_str, sala_id=SALA_ID, return_ok=F
             "fecha": fecha_str,
             "url": doc_url,
             "expediente": expediente,
-            "ponente": (s.get("SPONENOMBRE") or "").strip(),
-            "procedimiento": (s.get("SPROCDESCRIPCION") or "").strip(),
-            "partes": (s.get("SSENTPARTES") or "").strip(),
-            "decision_resumen": (s.get("SSENTDECISION") or "").strip(),
+            "ponente": _campo_texto(s, "SPONENOMBRE"),
+            "procedimiento": _campo_texto(s, "SPROCDESCRIPCION"),
+            "partes": _campo_texto(s, "SSENTPARTES"),
+            "decision_resumen": _campo_texto(s, "SSENTDECISION"),
             "archivo": nombre_doc,
         })
 
