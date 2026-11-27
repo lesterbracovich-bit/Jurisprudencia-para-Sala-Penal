@@ -58,6 +58,7 @@ except ImportError:
     print("=" * 60)
     sys.exit(1)
 
+from drive_sync import sync_csv_to_drive
 from llm_client import (
     LimiteDiarioExcedidoError,
     PREFERRED_GEMINI_MODELS,
@@ -1309,6 +1310,7 @@ def export_csv(conn):
                      "Ratificaciones / Precedentes","Archivo Origen","Enlace TSJ"])
         w.writerows(rows)
     print(f"\n📊 CSV exportado: {CSV_PATH}  ({len(rows)} registros)")
+    sync_csv_to_drive(CSV_PATH, quiet_if_unconfigured=True)
 
 
 # ─── Determinación Inteligente de Fechas ─────────────────────────────────────
