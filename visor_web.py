@@ -8,6 +8,7 @@ filtrar y leer sentencias y extractos jurisprudenciales del TSJ
 almacenados en SQLite (jurisprudencia_ia.db).
 """
 
+import base64
 import html
 import os
 import re
@@ -147,6 +148,68 @@ st.markdown(
         border: none;
         border-top: 1px solid rgba(148, 163, 184, 0.28);
     }
+    .tsj-card-footer {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-top: 12px;
+        padding-top: 10px;
+        border-top: 1px dashed rgba(148, 163, 184, 0.30);
+    }
+    .tsj-copy-group {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 8px;
+    }
+    .tsj-copy-label {
+        font-size: 0.88rem;
+        font-weight: 600;
+        color: var(--text-color) !important;
+        opacity: 0.82;
+        margin-right: 2px;
+    }
+    .tsj-copy-btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        padding: 5px 11px;
+        border-radius: 8px;
+        border: 1px solid rgba(148, 163, 184, 0.45);
+        background-color: var(--secondary-background-color);
+        color: var(--text-color);
+        font-size: 0.85rem;
+        font-weight: 600;
+        cursor: pointer;
+        transition: all 0.16s ease;
+        line-height: 1.3;
+        font-family: inherit;
+    }
+    .tsj-copy-btn:hover:not(:disabled) {
+        border-color: #2563eb;
+        background-color: rgba(37, 99, 235, 0.13);
+        transform: translateY(-1px);
+    }
+    .tsj-copy-btn:active:not(:disabled) {
+        transform: translateY(0);
+    }
+    .tsj-copy-btn.copied {
+        border-color: #047857 !important;
+        background-color: #059669 !important;
+        color: #ffffff !important;
+    }
+    .tsj-copy-btn:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+    }
+    .tsj-link-original {
+        font-weight: 600;
+        font-size: 0.92rem;
+        text-decoration: none;
+        white-space: nowrap;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -244,12 +307,227 @@ def get_sala_badge_class(sala: str) -> str:
     return "badge-sala-default"
 
 
+def _codificar_b64(texto: str) -> str:
+    """Codifica texto UTF-8 en Base64 ASCII seguro para atributos HTML data-*."""
+    return base64.b64encode(texto.encode("utf-8")).decode("ascii")
+
+
+def formatear_cita_textual(contenido_citado: str) -> str:
+    """Normaliza la cita textual para copiarla al portapapeles con comillas si no las tiene."""
+    cita = (contenido_citado or "").strip()
+    if not cita or cita == "Sin cita textual expresa":
+        return ""
+    if cita[0] in ('"', "“", "«"):
+        return cita
+    return f'"{cita}"'
+
+
+def formatear_datos_sentencia(numero: str, sala: str, fecha: str) -> str:
+    """Genera una referencia formal con número, sala y fecha de la sentencia."""
+    num_clean = str(numero or "").strip() or "S/N"
+    sala_clean = str(sala or "").strip()
+    fecha_clean = str(fecha or "").strip()
+
+    if "tribunal supremo" in sala_clean.lower():
+        sala_texto = f"de la {sala_clean}" if sala_clean.lower().startswith("sala") else sala_clean
+    elif sala_clean.lower().startswith("sala"):
+        sala_texto = f"de la {sala_clean} del Tribunal Supremo de Justicia"
+    elif sala_clean:
+        sala_texto = f"({sala_clean}) del Tribunal Supremo de Justicia"
+    else:
+        sala_texto = "del Tribunal Supremo de Justicia"
+
+    if not fecha_clean or fecha_clean.lower() in ("s/f", "sin fecha", "none", "null"):
+        return f"Sentencia N° {num_clean} {sala_texto} (S/F)"
+    return f"Sentencia N° {num_clean} {sala_texto}, de fecha {fecha_clean}"
+
+
+def construir_textos_copia(numero: str, sala: str, fecha: str, contenido_citado: str) -> tuple[str, str, str]:
+    """Devuelve la tupla (cita_textual, datos_sentencia, ambos) lista para copiar."""
+    texto_cita = formatear_cita_textual(contenido_citado)
+    texto_datos = formatear_datos_sentencia(numero, sala, fecha)
+    texto_ambos = f"{texto_datos}:\n\n{texto_cita}" if texto_cita else ""
+    return texto_cita, texto_datos, texto_ambos
+
+
+def _render_boton_copia(etiqueta: str, texto: str, tooltip: str, tooltip_vacio: str) -> str:
+    """Construye el HTML de un botón de copiado individual."""
+    if texto:
+        b64 = _codificar_b64(texto)
+        return (
+            f'<button type="button" class="tsj-copy-btn" '
+            f'data-copy-b64="{b64}" title="{html.escape(tooltip, quote=True)}">'
+            f'{html.escape(etiqueta)}</button>'
+        )
+    return (
+        f'<button type="button" class="tsj-copy-btn" disabled '
+        f'title="{html.escape(tooltip_vacio, quote=True)}">'
+        f'{html.escape(etiqueta)}</button>'
+    )
+
+
+def render_footer_tarjeta(numero: str, sala: str, fecha: str, contenido_citado: str, enlace: str) -> None:
+    """Renderiza los botones de copiado (cita, datos o ambos) y el enlace oficial TSJ."""
+    texto_cita, texto_datos, texto_ambos = construir_textos_copia(numero, sala, fecha, contenido_citado)
+    botones_html = "".join([
+        _render_boton_copia(
+            "💬 Cita textual",
+            texto_cita,
+            "Copiar únicamente la cita textual",
+            "No hay cita textual disponible",
+        ),
+        _render_boton_copia(
+            "📄 Datos de la sentencia",
+            texto_datos,
+            "Copiar número, sala y fecha de la sentencia",
+            "Sin datos disponibles",
+        ),
+        _render_boton_copia(
+            "📑 Ambos",
+            texto_ambos,
+            "Copiar los datos de la sentencia junto con la cita textual",
+            "Se requiere cita textual para copiar ambos",
+        ),
+    ])
+
+    link_html = ""
+    if enlace:
+        safe_url = html.escape(enlace, quote=True)
+        link_html = (
+            f'<a class="tsj-link-original" href="{safe_url}" '
+            f'target="_blank" rel="noopener noreferrer">'
+            f'🔗 Ver sentencia original en el TSJ</a>'
+        )
+
+    footer_html = (
+        f'<div class="tsj-card-footer">'
+        f'<div class="tsj-copy-group">'
+        f'<span class="tsj-copy-label">📋 Copiar:</span>'
+        f'{botones_html}'
+        f'</div>'
+        f'{link_html}'
+        f'</div>'
+    )
+    st.html(footer_html, width="stretch")
+
+
+_COPY_JS_SCRIPT = """
+<script>
+(function() {
+    if (window.__tsjCopyBound) return;
+    window.__tsjCopyBound = true;
+
+    function decodeBase64Utf8(b64) {
+        var bin = atob(b64);
+        var bytes = new Uint8Array(bin.length);
+        for (var i = 0; i < bin.length; i++) {
+            bytes[i] = bin.charCodeAt(i);
+        }
+        return new TextDecoder("utf-8").decode(bytes);
+    }
+
+    function fallbackCopy(text) {
+        var ta = document.createElement("textarea");
+        ta.value = text;
+        ta.setAttribute("readonly", "");
+        ta.style.position = "fixed";
+        ta.style.top = "0";
+        ta.style.left = "0";
+        ta.style.width = "1px";
+        ta.style.height = "1px";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        try {
+            ta.focus({ preventScroll: true });
+        } catch (_) {
+            ta.focus();
+        }
+        ta.select();
+        var ok = false;
+        try {
+            ok = document.execCommand("copy");
+        } catch (e) {
+            ok = false;
+        }
+        document.body.removeChild(ta);
+        return ok;
+    }
+
+    function copyText(text) {
+        if (navigator.clipboard && window.isSecureContext) {
+            return navigator.clipboard.writeText(text).catch(function() {
+                if (!fallbackCopy(text)) {
+                    throw new Error("Copy failed");
+                }
+            });
+        }
+        return new Promise(function(resolve, reject) {
+            if (fallbackCopy(text)) {
+                resolve();
+            } else {
+                reject(new Error("Copy failed"));
+            }
+        });
+    }
+
+    document.addEventListener("click", function(ev) {
+        var btn = ev.target && ev.target.closest ? ev.target.closest(".tsj-copy-btn") : null;
+        if (!btn || btn.disabled) return;
+        var b64 = btn.getAttribute("data-copy-b64") || "";
+        if (!b64) return;
+
+        var text = "";
+        try {
+            text = decodeBase64Utf8(b64);
+        } catch (e) {
+            return;
+        }
+
+        if (!btn.dataset.origLabel) {
+            btn.dataset.origLabel = btn.textContent;
+        }
+
+        copyText(text).then(function() {
+            if (btn.__resetTimer) {
+                clearTimeout(btn.__resetTimer);
+            }
+            btn.classList.add("copied");
+            btn.textContent = "✅ ¡Copiado!";
+            btn.__resetTimer = setTimeout(function() {
+                btn.classList.remove("copied");
+                if (btn.dataset.origLabel) {
+                    btn.textContent = btn.dataset.origLabel;
+                }
+            }, 1800);
+        }).catch(function() {
+            if (btn.__resetTimer) {
+                clearTimeout(btn.__resetTimer);
+            }
+            btn.textContent = "⚠️ No se pudo copiar";
+            btn.__resetTimer = setTimeout(function() {
+                if (btn.dataset.origLabel) {
+                    btn.textContent = btn.dataset.origLabel;
+                }
+            }, 2000);
+        });
+    });
+})();
+</script>
+"""
+
+
 # ─── Aplicación Principal ─────────────────────────────────────────────────────
 def main():
-    # Encabezado formal adaptable a modo claro y oscuro
-    st.markdown('<div class="main-title">⚖️ Sistema de Jurisprudencia del Tribunal Supremo de Justicia</div>', unsafe_allow_html=True)
-    st.markdown('<div class="sub-title">Consulta, búsqueda temática y lectura especializada de sentencias y criterios vinculantes</div>', unsafe_allow_html=True)
-    st.markdown('<div class="credit-line">📖 <em>Compilado por Lester Bracovich</em></div>', unsafe_allow_html=True)
+    # Encabezado formal adaptable a modo claro y oscuro + manejador global de copiado
+    st.html(
+        """
+        <div class="main-title">⚖️ Sistema de Jurisprudencia del Tribunal Supremo de Justicia</div>
+        <div class="sub-title">Consulta, búsqueda temática y lectura especializada de sentencias y criterios vinculantes</div>
+        <div class="credit-line">📖 <em>Compilado por Lester Bracovich</em></div>
+        """
+        + _COPY_JS_SCRIPT,
+        unsafe_allow_javascript=True,
+    )
 
     df = load_data()
 
@@ -545,15 +823,8 @@ def main():
                 st.markdown("**📜 Texto Literal Citado en el Documento:**")
                 st.markdown(f'<div class="cita-box">"{contenido_citado}"</div>', unsafe_allow_html=True)
 
-            if enlace:
-                safe_url = html.escape(enlace, quote=True)
-                st.markdown(
-                    f'<div style="margin-top: 10px;">'
-                    f'<a href="{safe_url}" target="_blank" rel="noopener noreferrer" '
-                    f'style="font-weight: 600; text-decoration: none;">'
-                    f'🔗 Ver sentencia original en el TSJ</a></div>',
-                    unsafe_allow_html=True,
-                )
+            # Barra de acciones de copiado + enlace oficial TSJ
+            render_footer_tarjeta(numero, sala, fecha, contenido_citado, enlace)
 
     # Controles de paginación inferiores (al final de los 20 criterios)
     st.write("")
