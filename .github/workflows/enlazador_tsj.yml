@@ -25,6 +25,8 @@ jobs:
         shell: cmd
         env:
           PYTHONIOENCODING: utf-8
+          DRIVE_WEBHOOK_URL: ${{ secrets.DRIVE_WEBHOOK_URL }}
+          DRIVE_WEBHOOK_TOKEN: ${{ secrets.DRIVE_WEBHOOK_TOKEN }}
           EXTRA_ARGS: ${{ inputs.reintentar_no_encontrados && '--reintentar-no-encontrados' || '' }}
         run: |
           if exist "C:\Users\Usuario\AppData\Local\Python\pythoncore-3.15-64\python.exe" (
